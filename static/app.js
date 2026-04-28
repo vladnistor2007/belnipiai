@@ -4,6 +4,7 @@ let currentConvId = null;
 let autoModelEnabled = true;
 let userOverrodeModel = false;
 let _modelMap = {}; // id → label
+let userScrolled = false;
 
 const sendIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`;
 const stopIcon  = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>`;
@@ -212,7 +213,8 @@ async function openChat(id) {
       addMsgCopy(ac, ac.innerHTML);
     }
   }
-  scrollEnd();
+  userScrolled = false;
+  scrollEnd(true);
 }
 
 async function deleteChat(e, id) {
@@ -417,7 +419,12 @@ function addMessage(role, content, badge) {
 }
 
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-function scrollEnd() { const a = document.getElementById('chat-area'); a.scrollTop = a.scrollHeight; }
+function scrollEnd(force = false) {
+  const a = document.getElementById('chat-area');
+  if (force || !userScrolled) {
+    a.scrollTop = a.scrollHeight;
+  }
+}
 
 // ── stop ──────────────────────────────────────────────────────────────────────
 
@@ -463,12 +470,13 @@ async function sendMessage() {
   const fc = currentFile, fn = fc ? fc.name : null;
   if (fc) removeFile();
 
-  addMessage('user', q, fn); scrollEnd();
+  userScrolled = false;
+  addMessage('user', q, fn); scrollEnd(true);
   const ac = addMessage('assistant', '');
   const dots = document.createElement('div');
   dots.className = 'thinking';
   dots.innerHTML = '<span></span><span></span><span></span>';
-  ac.appendChild(dots); scrollEnd();
+  ac.appendChild(dots); scrollEnd(true);
 
   const fd = new FormData();
   fd.append('question', q); fd.append('model', model);
@@ -631,4 +639,10 @@ initNavState();
 loadModels();
 loadConversations();
 ta.focus();
+
+// Останавливаем автоскролл если пользователь уходит вверх
+document.getElementById('chat-area').addEventListener('scroll', () => {
+  const a = document.getElementById('chat-area');
+  userScrolled = a.scrollHeight - a.scrollTop - a.clientHeight > 80;
+});
 
