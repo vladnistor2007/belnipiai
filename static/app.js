@@ -239,13 +239,7 @@ function clearFeed() {
   welcome.id = 'empty-state';
   welcome.innerHTML = `
     <div class="welcome-title">Добрый день</div>
-    <div class="welcome-sub">Загрузите документ или задайте вопрос — анализирую PDF, DOCX, Excel, изображения и другие форматы</div>
-    <div class="chips">
-      <div class="chip" onclick="setPrompt('Кратко изложи содержание')">Кратко изложи содержание</div>
-      <div class="chip" onclick="setPrompt('Выдели ключевые факты и цифры')">Ключевые факты и цифры</div>
-      <div class="chip" onclick="setPrompt('Какие обязательства сторон?')">Обязательства сторон</div>
-      <div class="chip" onclick="setPrompt('Сделай структурированное резюме')">Структурированное резюме</div>
-    </div>`;
+    <div class="welcome-sub">Загрузите документ или задайте вопрос — анализирую PDF, DOCX, Excel, изображения и другие форматы</div>`;
   inner.appendChild(welcome);
 }
 
