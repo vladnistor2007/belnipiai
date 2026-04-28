@@ -598,6 +598,8 @@ body::before {
   gap: 14px;
   margin-bottom: 8px;
   animation: up .2s ease;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .msg + .msg.assistant,
@@ -662,6 +664,7 @@ body::before {
   flex: 1;
   min-width: 0;
   max-width: min(100%, 920px);
+  overflow: hidden;
 }
 
 .msg.assistant .msg-role {
