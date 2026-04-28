@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import base64
 import json
 import tempfile
@@ -322,21 +323,36 @@ def save_message(conv_id: str, role: str, content: str, model: str = MODEL_DEFAU
         conn.commit()
 
 
-def generate_title(question: str, model: str, num_ctx: int) -> str:
+def generate_title(question: str, model: str) -> str:
     try:
+        prompt = (
+            "Придумай краткое название для этого чата. "
+            "Требования: 2–5 слов, назывное предложение (без глагола в начале), "
+            "без кавычек, без точки в конце, только суть запроса.\n"
+            "Хорошие примеры: Анализ договора аренды / Структура годового отчёта / "
+            "Расчёт налогового вычета / Сравнение технических характеристик\n"
+            "Плохие примеры: Помогите мне / Вопрос пользователя / Чат с ИИ\n\n"
+            f"Запрос: {question[:400]}\n\n"
+            "Название:"
+        )
         resp = _client.chat(
             model=model,
-            messages=[{
-                "role": "user",
-                "content": f"Придумай короткое название для чата (3-6 слов, без кавычек) по этому запросу:\n{question}"
-            }],
-            options={"num_ctx": num_ctx, "temperature": 0.3},
+            messages=[{"role": "user", "content": prompt}],
+            options={"num_ctx": 2048, "temperature": 0.1},
             stream=False
         )
-        title = resp["message"]["content"].strip().strip('"').strip("'")
-        return title[:60] if title else question[:40]
+        raw = resp["message"]["content"]
+        # Убираем теги <think>...</think> (Gemma иногда их выводит)
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+        # Берём только первую непустую строку
+        title = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
+        # Убираем кавычки и лишние символы
+        title = title.strip('"\'«»').rstrip(".,;:!?").strip()
+        # Если модель всё равно начала с "Название:", обрезаем
+        title = re.sub(r"(?i)^название\s*:\s*", "", title).strip()
+        return title[:60] if title else question[:50]
     except Exception:
-        return question[:40]
+        return question[:50]
 
 
 # ── утилиты файлов ────────────────────────────────────────────────────────────
@@ -755,7 +771,7 @@ def api_chat(conv_id):
                         cnt = cur.fetchone()["cnt"]
 
                 if cnt == 1:
-                    title = generate_title(question, model, profile["num_ctx"])
+                    title = generate_title(question, model)
                     with get_db() as conn:
                         with conn.cursor() as cur:
                             cur.execute("UPDATE conversations SET title = %s WHERE id = %s", (title, conv_id))
