@@ -16,18 +16,12 @@
   <aside class="nav">
     <div class="nav-brand">
       <img src="/name.png?v=2" class="nav-brand-wordmark" alt="Белнипиэнергопром">
-      <div class="nav-brand-actions">
-        <button class="nav-icon-btn" onclick="newChat()" title="Новый чат">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-          </svg>
-        </button>
-        <button class="nav-icon-btn nav-collapse-btn" onclick="toggleNav()" title="Свернуть панель">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="15 18 9 12 15 6"/>
-          </svg>
-        </button>
-      </div>
+      <button class="nav-collapse-btn" onclick="toggleNav()" title="Свернуть панель">
+        <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="1" y="1" width="16" height="16" rx="3"/>
+          <line x1="6" y1="1" x2="6" y2="17"/>
+        </svg>
+      </button>
     </div>
 
     <div class="nav-body">
@@ -45,7 +39,14 @@
         <input type="hidden" id="model-select" value="">
       </div>
 
-      <div class="chats-label">Чаты</div>
+      <div class="chats-header">
+        <div class="chats-label">Чаты</div>
+        <button class="new-chat-plus" onclick="newChat()" title="Новый чат">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+        </button>
+      </div>
       <div class="chats-list" id="chats-list">
         <div class="chats-empty">Нет чатов</div>
       </div>

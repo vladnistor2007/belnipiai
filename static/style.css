@@ -108,37 +108,56 @@ body::before {
   border-radius: 0;
 }
 
-.nav-brand-actions {
-  display: flex;
-  gap: 5px;
+.nav-collapse-btn {
   margin-left: auto;
   flex-shrink: 0;
-}
-
-.nav-icon-btn {
-  width: 32px;
-  height: 32px;
-  border-radius: 9px;
-  background: rgba(26,86,165,0.07);
-  border: 1px solid rgba(26,86,165,0.14);
+  background: none;
+  border: none;
   color: var(--muted);
   cursor: pointer;
+  padding: 4px;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 0;
-  flex-shrink: 0;
-  transition: background .15s, color .15s, transform .12s;
+  border-radius: 8px;
+  transition: color .15s, background .15s;
 }
 
-.nav-icon-btn:hover {
-  background: rgba(26,86,165,0.16);
-  border-color: rgba(26,86,165,0.28);
+.nav-collapse-btn:hover {
   color: var(--primary);
-  transform: scale(1.06);
+  background: rgba(26,86,165,0.08);
 }
 
-.nav-icon-btn svg { width: 15px; height: 15px; }
+.nav-collapse-btn svg { width: 20px; height: 20px; display: block; }
+
+.chats-header {
+  display: flex;
+  align-items: center;
+  margin: 18px 0 8px 2px;
+}
+
+.chats-header .chats-label { margin: 0; flex: 1; }
+
+.new-chat-plus {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  transition: color .15s, background .15s, transform .12s;
+}
+
+.new-chat-plus:hover {
+  color: var(--primary);
+  background: rgba(26,86,165,0.08);
+  transform: scale(1.1);
+}
+
+.new-chat-plus svg { width: 16px; height: 16px; }
 
 .nav-body {
   flex: 1;
@@ -210,7 +229,6 @@ body::before {
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--muted);
-  margin: 18px 0 8px 2px;
 }
 
 .chats-list {
