@@ -3,6 +3,7 @@ let abortController = null;
 let currentConvId = null;
 let autoModelEnabled = true;
 let userOverrodeModel = false;
+let _modelMap = {}; // id → label
 
 const sendIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`;
 const stopIcon  = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>`;
@@ -248,20 +249,66 @@ function clearFeed() {
 async function loadModels() {
   try {
     const d = await fetch('/api/models').then(r => r.json());
-    const sel = document.getElementById('model-select');
-    sel.innerHTML = '';
     const models = d.models && d.models.length ? d.models : [{id: 'gemma3:4b', label: 'Базовая'}];
+    _modelMap = {};
     models.forEach(m => {
-      const o = document.createElement('option');
-      o.value = typeof m === 'string' ? m : m.id;
-      o.textContent = typeof m === 'string' ? m : m.label;
-      sel.appendChild(o);
+      const id = typeof m === 'string' ? m : m.id;
+      const label = typeof m === 'string' ? m : m.label;
+      _modelMap[id] = label;
     });
+    renderModelDrop(models);
+    if (models.length) {
+      const first = typeof models[0] === 'string' ? models[0] : models[0].id;
+      selectModel(first);
+    }
   } catch {
     document.getElementById('stat-status').textContent = 'Нет соединения';
     document.getElementById('status-dot').classList.add('off');
   }
 }
+
+function renderModelDrop(models) {
+  const drop = document.getElementById('model-sel-drop');
+  drop.innerHTML = '';
+  models.forEach(m => {
+    const id = typeof m === 'string' ? m : m.id;
+    const label = typeof m === 'string' ? m : m.label;
+    const opt = document.createElement('div');
+    opt.className = 'csel-opt';
+    opt.dataset.id = id;
+    opt.textContent = label;
+    opt.addEventListener('click', () => { selectModel(id, true); closeDrop(); });
+    drop.appendChild(opt);
+  });
+}
+
+function selectModel(id, userChose = false) {
+  document.getElementById('model-select').value = id;
+  document.getElementById('model-sel-val').textContent = _modelMap[id] || id;
+  document.querySelectorAll('.csel-opt').forEach(opt => {
+    opt.classList.toggle('active', opt.dataset.id === id);
+  });
+  if (userChose) {
+    userOverrodeModel = true;
+    clearAutoModelBadge();
+  }
+}
+
+function toggleDrop() {
+  const drop = document.getElementById('model-sel-drop');
+  const trigger = document.getElementById('model-sel-trigger');
+  const isOpen = drop.classList.toggle('open');
+  trigger.classList.toggle('open', isOpen);
+}
+
+function closeDrop() {
+  document.getElementById('model-sel-drop').classList.remove('open');
+  document.getElementById('model-sel-trigger').classList.remove('open');
+}
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('#model-sel-wrap')) closeDrop();
+});
 
 // ── textarea ──────────────────────────────────────────────────────────────────
 
@@ -313,9 +360,8 @@ async function detectFileAndSelectModel(f) {
     const fd = new FormData();
     fd.append('file', f);
     const data = await fetch('/api/detect-file', { method: 'POST', body: fd }).then(r => r.json());
-    const sel = document.getElementById('model-select');
-    if (data.model && sel.querySelector(`option[value="${data.model}"]`)) {
-      sel.value = data.model;
+    if (data.model && _modelMap[data.model]) {
+      selectModel(data.model);
       showAutoModelBadge(data.model, data.reason);
     }
   } catch(e) {
@@ -494,18 +540,15 @@ async function autoSelectModel(fileExt, question) {
       body: JSON.stringify({file_ext: fileExt, question})
     }).then(r => r.json());
 
-    const sel = document.getElementById('model-select');
-    if (data.model && sel.querySelector(`option[value="${data.model}"]`)) {
-      sel.value = data.model;
+    if (data.model && _modelMap[data.model]) {
+      selectModel(data.model);
       showAutoModelBadge(data.model, data.reason);
     }
   } catch(e) {}
 }
 
 function showAutoModelBadge(model, reason) {
-  const sel = document.getElementById('model-select');
-  const opt = sel ? sel.querySelector(`option[value="${model}"]`) : null;
-  const label = opt ? opt.textContent : model;
+  const label = _modelMap[model] || model;
 
   let badge = document.getElementById('auto-model-badge');
   if (!badge) {
@@ -589,8 +632,3 @@ loadModels();
 loadConversations();
 ta.focus();
 
-// Сбрасываем авто при ручном выборе
-document.getElementById('model-select').addEventListener('change', () => {
-  userOverrodeModel = true;
-  clearAutoModelBadge();
-});

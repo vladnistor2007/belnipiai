@@ -32,15 +32,17 @@
 
     <div class="nav-body">
       <div class="field-label">Модель</div>
-      <div class="sel-wrap">
-        <select class="sel" id="model-select">
-          <option value="">Загрузка...</option>
-        </select>
-        <span class="sel-arr">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="6 9 12 15 18 9"/>
-          </svg>
-        </span>
+      <div class="sel-wrap" id="model-sel-wrap">
+        <div class="csel" id="model-sel-trigger" onclick="toggleDrop()">
+          <span class="csel-val" id="model-sel-val">Загрузка...</span>
+          <span class="csel-arr">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 9 12 15 18 9"/>
+            </svg>
+          </span>
+        </div>
+        <div class="csel-drop" id="model-sel-drop"></div>
+        <input type="hidden" id="model-select" value="">
       </div>
 
       <div class="chats-label">Чаты</div>
