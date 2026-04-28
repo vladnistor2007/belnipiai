@@ -93,37 +93,19 @@ body::before {
   flex-shrink: 0;
 }
 
-.nav-brand-ico {
-  width: 38px;
-  height: 38px;
-  border-radius: 12px;
-  object-fit: contain;
-  flex-shrink: 0;
-  background: rgba(255, 255, 255, 0.65);
-  border: 1px solid rgba(198, 216, 236, 0.9);
-  padding: 5px;
-  box-shadow: 0 6px 16px rgba(26, 57, 100, 0.1);
-}
-
-.nav-brand-lockup {
-  min-width: 0;
+.nav-brand .nav-brand-wordmark {
   flex: 1;
-}
-
-.nav-brand-name {
-  font-size: 18px;
-  font-weight: 800;
-  color: var(--primary);
-  letter-spacing: 0;
-  line-height: 1.2;
-}
-
-.nav-brand-label {
-  font-size: 12px;
-  color: var(--muted);
-  margin-top: 0;
-  line-height: 1.35;
-  max-width: 230px;
+  min-width: 0;
+  height: 36px;
+  width: auto;
+  max-width: 200px;
+  object-fit: contain;
+  object-position: left center;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  border-radius: 0;
 }
 
 .nav-brand-actions {
@@ -168,10 +150,9 @@ body::before {
 }
 
 .nav-open-btn {
-  position: absolute;
+  position: fixed;
   left: 28px;
-  top: 50%;
-  transform: translateY(-50%);
+  top: 28px;
   width: 36px;
   height: 36px;
   border-radius: 11px;
@@ -191,7 +172,7 @@ body::before {
 .nav-open-btn:hover {
   background: rgba(255,255,255,0.18);
   color: #fff;
-  transform: translateY(-50%) scale(1.06);
+  transform: scale(1.06);
 }
 
 .nav-open-btn svg { width: 17px; height: 17px; }
@@ -426,22 +407,11 @@ body::before {
   display: flex;
   justify-content: center;
   align-items: center;
-  padding: 22px 28px 8px;
+  padding: 0;
   position: relative;
   z-index: 1;
-}
-
-.page-brand-wordmark {
-  display: block;
-  width: min(100%, 360px);
-  height: auto;
-  object-fit: contain;
-  padding: 8px 16px 11px;
-  border-radius: 18px;
-  background: rgba(247, 251, 255, 0.84);
-  border: 1px solid rgba(208, 226, 246, 0.92);
-  box-shadow: 0 14px 34px rgba(4, 16, 46, 0.22);
-  transform: translateY(-2px);
+  height: 0;
+  overflow: visible;
 }
 
 .page::before {
@@ -1109,8 +1079,7 @@ body::before {
   .shell { gap: 14px; padding: 14px; }
   .nav { width: 338px; }
   .nav.collapsed { margin-right: -14px; }
-  .page-brand { padding: 18px 22px 6px; }
-  .nav-open-btn { left: 22px; }
+  .nav-open-btn { left: 22px; top: 22px; }
   .feed-inner { padding: 28px 28px 20px; }
   .bar { padding: 0 24px 22px; }
 }
@@ -1119,9 +1088,7 @@ body::before {
   .shell { padding: 12px; gap: 12px; }
   .nav { width: 300px; }
   .nav.collapsed { margin-right: -12px; }
-  .page-brand { padding: 16px 16px 4px; }
-  .nav-open-btn { left: 16px; }
-  .page-brand-wordmark { width: min(100%, 400px); padding: 9px 16px 13px; }
+  .nav-open-btn { left: 16px; top: 16px; }
   .feed-inner { padding: 22px 18px 16px; }
   .bar { padding: 0 12px 16px; }
   .bar-inner { max-width: none; }
@@ -1137,9 +1104,7 @@ body::before {
   .nav.collapsed { margin-right: -280px; width: 280px; opacity: 0; }
   .page { border-radius: 0; border-left: none; border-right: none; }
   .page::before { inset: 8px 8px 92px; border-radius: 20px; }
-  .page-brand { padding: 12px 10px 2px; }
-  .nav-open-btn { left: 10px; }
-  .page-brand-wordmark { width: min(100%, 320px); padding: 8px 12px 12px; border-radius: 14px; }
+  .nav-open-btn { left: 10px; top: 10px; }
   .feed-inner { padding: 16px 12px 14px; }
   .welcome-title { font-size: 34px; }
   .welcome-sub { font-size: 16px; }
