@@ -325,32 +325,39 @@ def save_message(conv_id: str, role: str, content: str, model: str = MODEL_DEFAU
 
 def generate_title(question: str, model: str) -> str:
     try:
-        prompt = (
-            "Придумай краткое название для этого чата. "
-            "Требования: 2–5 слов, назывное предложение (без глагола в начале), "
-            "без кавычек, без точки в конце, только суть запроса.\n"
-            "Хорошие примеры: Анализ договора аренды / Структура годового отчёта / "
-            "Расчёт налогового вычета / Сравнение технических характеристик\n"
-            "Плохие примеры: Помогите мне / Вопрос пользователя / Чат с ИИ\n\n"
-            f"Запрос: {question[:400]}\n\n"
-            "Название:"
-        )
         resp = _client.chat(
             model=model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты генерируешь названия чатов. "
+                        "Отвечай ТОЛЬКО самим названием — одной строкой, 2–4 слова. "
+                        "Никаких объяснений, никаких списков, никаких кавычек."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Название чата по запросу:\n{question[:400]}"
+                }
+            ],
             options={"num_ctx": 2048, "temperature": 0.1},
             stream=False
         )
         raw = resp["message"]["content"]
-        # Убираем теги <think>...</think> (Gemma иногда их выводит)
-        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
-        # Берём только первую непустую строку
-        title = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
-        # Убираем кавычки и лишние символы
+        # Убираем теги <think>...</think>
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        # Если модель вернула список — берём первый пункт
+        m = re.search(r"^[\d\-\*•]\s*\.?\s*(.+)$", raw, re.MULTILINE)
+        title = m.group(1).strip() if m else next(
+            (ln.strip() for ln in raw.splitlines() if ln.strip()), ""
+        )
+        # Убираем типичные «мусорные» префиксы
+        title = re.sub(
+            r"(?i)^(название|title|тема|чат|вот|итого|ответ)\s*[:\-–—]?\s*", "", title
+        ).strip()
         title = title.strip('"\'«»').rstrip(".,;:!?").strip()
-        # Если модель всё равно начала с "Название:", обрезаем
-        title = re.sub(r"(?i)^название\s*:\s*", "", title).strip()
-        return title[:60] if title else question[:50]
+        return title[:60] if len(title) > 2 else question[:50]
     except Exception:
         return question[:50]
 
@@ -625,11 +632,6 @@ def api_chat(conv_id):
                 yield "data: [DONE]\n\n"
 
             else:
-                model_label = MODEL_LABELS.get(model, model)
-                ctx_info = f"📄 **{file_name}** | модель: **{model_label}** | контекст: **{profile['num_ctx']} токенов**\n\n"
-                yield f"data: {json.dumps({'text': ctx_info})}\n\n"
-                full_response.append(ctx_info)
-
                 if ext in (".txt", ".md", ".log"):
                     text = read_txt(tmp_path)
                     extracted_text = text
