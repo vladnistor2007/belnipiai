@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>БелнипиAI</title>
+<link rel="icon" type="image/png" href="/ico.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="shell">
+
+  <aside class="nav">
+    <div class="nav-brand">
+      <img src="/name.png?v=2" class="nav-brand-wordmark" alt="Белнипиэнергопром">
+      <button class="nav-collapse-btn" onclick="toggleNav()" title="Свернуть панель">
+        <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="1" y="1" width="16" height="16" rx="3"/>
+          <line x1="6" y1="1" x2="6" y2="17"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="nav-body">
+      <div class="field-label">Модель</div>
+      <div class="sel-wrap" id="model-sel-wrap">
+        <div class="csel" id="model-sel-trigger" onclick="toggleDrop()">
+          <span class="csel-val" id="model-sel-val">Загрузка...</span>
+          <span class="csel-arr">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 9 12 15 18 9"/>
+            </svg>
+          </span>
+        </div>
+        <div class="csel-drop" id="model-sel-drop"></div>
+        <input type="hidden" id="model-select" value="">
+      </div>
+
+      <div class="chats-header">
+        <div class="chats-label">Чаты</div>
+        <button class="new-chat-plus" onclick="newChat()" title="Новый чат">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+        </button>
+      </div>
+      <div class="chats-list" id="chats-list">
+        <div class="chats-empty">Нет чатов</div>
+      </div>
+    </div>
+
+    <div class="nav-foot">
+      <div class="dot" id="status-dot"></div>
+      <span id="stat-status">Система работает</span>
+      <span class="user-pill" id="current-user">Гость</span>
+      <button class="del-all-btn" onclick="deleteAllChats()" title="Удалить все чаты">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="3 6 5 6 21 6"/>
+          <path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
+          <path d="M10 11v6"/><path d="M14 11v6"/>
+          <path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/>
+        </svg>
+      </button>
+    </div>
+  </aside>
+
+  <main class="page">
+    <div class="page-brand">
+      <button class="nav-open-btn" onclick="toggleNav()" title="Открыть панель">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+      </button>
+    </div>
+    <div class="feed" id="chat-area">
+      <div class="feed-inner" id="chat-inner">
+
+        <div class="welcome" id="empty-state">
+          <div class="welcome-title">Добрый день</div>
+          <div class="welcome-sub">Загрузите документ или задайте вопрос — анализирую PDF, DOCX, Excel, изображения и другие форматы</div>
+        </div>
+
+      </div>
+    </div>
+
+    <div class="bar">
+      <div class="bar-inner">
+        <div class="file-chip" id="file-preview">
+          <div class="file-chip-info">
+            <span class="file-chip-name" id="file-preview-name"></span>
+            <span class="file-chip-size" id="file-preview-size"></span>
+          </div>
+          <button class="file-chip-rm" onclick="removeFile()" title="Удалить">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div class="composer" id="input-box">
+          <button class="attach" onclick="document.getElementById('file-input').click()" title="Прикрепить файл">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
+            </svg>
+          </button>
+          <textarea id="input-field" placeholder="Задайте вопрос или загрузите документ..." rows="1"></textarea>
+          <button class="send" id="send-btn" onclick="sendMessage()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+            </svg>
+          </button>
+        </div>
+        <input type="file" id="file-input" style="display:none"
+          accept=".pdf,.docx,.doc,.xlsx,.xls,.xlsm,.txt,.md,.csv,.tsv,.png,.jpg,.jpeg,.webp,.gif,.tiff,.bmp">
+      </div>
+    </div>
+  </main>
+</div>
+
+<div class="drop" id="drop-overlay">
+  <div class="drop-inner">
+    <div class="drop-icon">📂</div>
+    <div class="drop-ttl">Перетащите файл сюда</div>
+    <div class="drop-sub">PDF, DOCX, XLSX, изображения...</div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

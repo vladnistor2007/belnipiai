@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+env/
+
+# Data & uploads
+uploads/
+*.db
+*.sqlite3
+
+# Env / secrets
+.env
+.env.*
+
+# Claude internal
+.claude/
+.claude.zip
+
+# OS
+.DS_Store
+Thumbs.db
