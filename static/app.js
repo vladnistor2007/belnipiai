@@ -537,6 +537,12 @@ function showToast(msg, err) {
 
 // ── nav collapse ──────────────────────────────────────────────────────────────
 
+function collapseNav() {
+  document.querySelector('.shell').classList.add('nav-collapsed');
+  document.querySelector('.nav').classList.add('collapsed');
+  localStorage.setItem('navCollapsed', 'true');
+}
+
 function toggleNav() {
   const shell = document.querySelector('.shell');
   const nav = document.querySelector('.nav');
@@ -549,11 +555,17 @@ function initNavState() {
   const saved = localStorage.getItem('navCollapsed');
   const isSmall = window.innerWidth < 900;
   const shouldCollapse = saved === 'true' || (saved === null && isSmall);
-  if (shouldCollapse) {
-    document.querySelector('.shell').classList.add('nav-collapsed');
-    document.querySelector('.nav').classList.add('collapsed');
-  }
+  if (shouldCollapse) collapseNav();
 }
+
+let _lastInnerWidth = window.innerWidth;
+window.addEventListener('resize', () => {
+  const w = window.innerWidth;
+  if (w < _lastInnerWidth && !document.querySelector('.shell').classList.contains('nav-collapsed')) {
+    collapseNav();
+  }
+  _lastInnerWidth = w;
+});
 
 // ── delete all chats ──────────────────────────────────────────────────────────
 
