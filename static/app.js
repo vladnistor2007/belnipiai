@@ -179,7 +179,7 @@ function renderConvList(convs) {
 }
 
 async function newChat() {
-  const model = document.getElementById('model-select').value || 'qwen2.5:3b';
+  const model = document.getElementById('model-select').value || 'gemma3:4b';
   const data = await fetch('/api/conversations', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -250,9 +250,11 @@ async function loadModels() {
     const d = await fetch('/api/models').then(r => r.json());
     const sel = document.getElementById('model-select');
     sel.innerHTML = '';
-    (d.models && d.models.length ? d.models : ['qwen2.5:3b']).forEach(m => {
+    const models = d.models && d.models.length ? d.models : [{id: 'gemma3:4b', label: 'Базовая'}];
+    models.forEach(m => {
       const o = document.createElement('option');
-      o.value = m; o.textContent = m;
+      o.value = typeof m === 'string' ? m : m.id;
+      o.textContent = typeof m === 'string' ? m : m.label;
       sel.appendChild(o);
     });
   } catch {
@@ -388,7 +390,7 @@ async function sendMessage() {
     await autoSelectModel('', q);
   }
 
-  const model = document.getElementById('model-select').value || 'qwen2.5:3b';
+  const model = document.getElementById('model-select').value || 'gemma3:4b';
   userOverrodeModel = false;
   clearAutoModelBadge();
 
@@ -501,6 +503,10 @@ async function autoSelectModel(fileExt, question) {
 }
 
 function showAutoModelBadge(model, reason) {
+  const sel = document.getElementById('model-select');
+  const opt = sel ? sel.querySelector(`option[value="${model}"]`) : null;
+  const label = opt ? opt.textContent : model;
+
   let badge = document.getElementById('auto-model-badge');
   if (!badge) {
     badge = document.createElement('span');
@@ -509,7 +515,7 @@ function showAutoModelBadge(model, reason) {
   }
   badge.className = 'auto-model-badge';
   badge.title = reason;
-  badge.innerHTML = `<span class="auto-model-label">авто</span><span class="auto-model-name">${esc(model)}</span>`;
+  badge.innerHTML = `<span class="auto-model-label">авто</span><span class="auto-model-name">${esc(label)}</span>`;
   badge.style.display = 'inline-flex';
 }
 

@@ -24,27 +24,27 @@ _client = ollama.Client(host=OLLAMA_HOST)
 
 # ── модели ────────────────────────────────────────────────────────────────────
 
+# Отображаемые названия для фронтенда
+MODEL_LABELS = {
+    "gemma3:4b":  "Базовая",   # ноутбук
+    "gemma4:e4b": "Базовая",   # сервер
+    "gemma4:26b": "Pro",        # сервер
+}
+
 MODEL_PROFILES = {
-    "qwen3:14b":  {"num_ctx": 14000, "chunk_tokens": 11000, "no_think": True},
-    "gemma4:e4b": {"num_ctx": 14000, "chunk_tokens": 11000, "no_think": False},
     "gemma3:4b":  {"num_ctx": 14000, "chunk_tokens": 11000, "no_think": False},
+    "gemma4:e4b": {"num_ctx": 14000, "chunk_tokens": 11000, "no_think": False},
+    "gemma4:26b": {"num_ctx": 14000, "chunk_tokens": 11000, "no_think": False},
 }
 
 DEFAULT_PROFILE = {"num_ctx": 14000, "chunk_tokens": 11000, "no_think": False}
 
-# Приоритеты моделей по задачам. suggest_model фильтрует по тем, что реально есть в Ollama,
-# поэтому списки одинаковы — на сервере выиграет gemma4:e4b/qwen3:14b, локально — gemma3:4b.
 MODEL_TASK_PRIORITY = {
-    "image":    (["gemma4:e4b", "gemma3:4b", "qwen3:14b"],
-                 "Изображение — нужна vision-модель"),
-    "document": (["qwen3:14b", "gemma4:e4b", "gemma3:4b"],
-                 "Документ — нужен большой контекст"),
-    "table":    (["qwen3:14b", "gemma4:e4b", "gemma3:4b"],
-                 "Таблица — нужна аналитическая модель"),
-    "complex":  (["qwen3:14b", "gemma4:e4b", "gemma3:4b"],
-                 "Сложный вопрос — нужна умная модель"),
-    "simple":   (["gemma3:4b", "gemma4:e4b", "qwen3:14b"],
-                 "Простой вопрос"),
+    "image":    (["gemma4:26b", "gemma4:e4b", "gemma3:4b"], "Изображение — нужна vision-модель"),
+    "document": (["gemma4:26b", "gemma4:e4b", "gemma3:4b"], "Документ — нужен большой контекст"),
+    "table":    (["gemma4:26b", "gemma4:e4b", "gemma3:4b"], "Таблица — нужна аналитическая модель"),
+    "complex":  (["gemma4:26b", "gemma4:e4b", "gemma3:4b"], "Сложный вопрос — нужна умная модель"),
+    "simple":   (["gemma3:4b", "gemma4:e4b", "gemma4:26b"], "Простой вопрос"),
 }
 
 COMPLEX_KEYWORDS = {
@@ -609,7 +609,8 @@ def api_chat(conv_id):
                 yield "data: [DONE]\n\n"
 
             else:
-                ctx_info = f"📄 **{file_name}** | модель: **{model}** | контекст: **{profile['num_ctx']} токенов**\n\n"
+                model_label = MODEL_LABELS.get(model, model)
+                ctx_info = f"📄 **{file_name}** | модель: **{model_label}** | контекст: **{profile['num_ctx']} токенов**\n\n"
                 yield f"data: {json.dumps({'text': ctx_info})}\n\n"
                 full_response.append(ctx_info)
 
@@ -792,7 +793,14 @@ def name_image():
 
 @app.route("/api/models")
 def api_models():
-    return {"models": get_available_models()}
+    available = get_available_models()
+    result, seen_labels = [], set()
+    for m in available:
+        label = MODEL_LABELS.get(m, m)
+        if label not in seen_labels:
+            result.append({"id": m, "label": label})
+            seen_labels.add(label)
+    return {"models": result}
 
 
 @app.route("/api/detect-file", methods=["POST"])
