@@ -1,0 +1,913 @@
+let currentFile = null, isStreaming = false;
+let abortController = null;
+let currentConvId = null;
+let autoModelEnabled = true;
+let userOverrodeModel = false;
+let _modelMap = {}; // id → label
+let userScrolled = false;
+
+const sendIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`;
+const stopIcon  = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>`;
+const cpIco = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>`;
+const okIco  = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
+
+// ── copy ─────────────────────────────────────────────────────────────────────
+
+function htmlToReadable(html) {
+  const d = document.createElement('div');
+  d.innerHTML = html;
+  return nodeToText(d).replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function nodeToText(n) {
+  if (n.nodeType === Node.TEXT_NODE) return n.textContent;
+  const t = n.tagName ? n.tagName.toLowerCase() : '';
+  const ch = () => Array.from(n.childNodes).map(nodeToText).join('');
+  if (t === 'pre') {
+    const c = n.querySelector('code');
+    const tx = (c || n).innerText;
+    const lg = (c && c.className.match(/language-(\w+)/)?.[1]) || '';
+    return '\n```' + lg + '\n' + tx.trimEnd() + '\n```\n';
+  }
+  if (t === 'code') return '`' + n.textContent + '`';
+  if (t === 'table') return tblAscii(n) + '\n';
+  if (['thead','tbody','tfoot','tr','th','td'].includes(t)) return ch();
+  if (t === 'h1') return '\n# '   + ch().trim() + '\n';
+  if (t === 'h2') return '\n## '  + ch().trim() + '\n';
+  if (t === 'h3') return '\n### ' + ch().trim() + '\n';
+  if (t === 'ul') return '\n' + Array.from(n.children).map(li => '• ' + nodeToText(li).trim()).join('\n') + '\n';
+  if (t === 'ol') return '\n' + Array.from(n.children).map((li, i) => (i+1) + '. ' + nodeToText(li).trim()).join('\n') + '\n';
+  if (t === 'li') return ch();
+  if (['p','div','blockquote','section','article'].includes(t)) return '\n' + ch().trim() + '\n';
+  if (t === 'br') return '\n';
+  if (t === 'hr') return '\n' + '─'.repeat(36) + '\n';
+  return ch();
+}
+
+function tblAscii(el) {
+  const rows = [];
+  el.querySelectorAll('tr').forEach(r =>
+    rows.push(Array.from(r.querySelectorAll('th,td')).map(c => c.innerText.replace(/\n/g,' ').trim()))
+  );
+  if (!rows.length) return '';
+  const cols = Math.max(...rows.map(r => r.length));
+  rows.forEach(r => { while (r.length < cols) r.push(''); });
+  const ws = Array.from({length: cols}, (_, c) => Math.max(...rows.map(r => r[c].length), 3));
+  const sep = '+-' + ws.map(w => '-'.repeat(w)).join('-+-') + '-+';
+  const row = cs => '| ' + cs.map((c,i) => c.padEnd(ws[i])).join(' | ') + ' |';
+  const ls = [sep];
+  rows.forEach((r,i) => { ls.push(row(r)); if (i===0) ls.push(sep); });
+  ls.push(sep);
+  return '\n' + ls.join('\n') + '\n';
+}
+
+function tblPlain(el) {
+  const rows = [];
+  el.querySelectorAll('tr').forEach(r =>
+    rows.push(Array.from(r.querySelectorAll('th,td')).map(c => c.innerText.replace(/\n+/g,' ').trim()).join('\t'))
+  );
+  return rows.join('\n').trim();
+}
+
+function doCopy(text, btn) {
+  const iconOnly = btn.classList.contains('tcbtn');
+  const ok = () => {
+    btn.classList.add('ok');
+    btn.innerHTML = iconOnly ? okIco : okIco + ' copied';
+    setTimeout(() => {
+      btn.classList.remove('ok');
+      btn.innerHTML = iconOnly ? cpIco : cpIco + (btn.dataset.lbl || ' copy');
+    }, 2000);
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(ok).catch(() => fbCopy(text, ok));
+  } else {
+    fbCopy(text, ok);
+  }
+}
+
+function fbCopy(text, cb) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;top:-9999px;opacity:0';
+  document.body.appendChild(ta);
+  ta.focus(); ta.select();
+  try { document.execCommand('copy'); cb(); } catch(e) {}
+  document.body.removeChild(ta);
+}
+
+function addCodeBtns(el) {
+  el.querySelectorAll('pre').forEach(pre => {
+    if (pre.parentElement.classList.contains('code-wrap')) return;
+    const w = document.createElement('div');
+    w.className = 'code-wrap';
+    pre.parentNode.insertBefore(w, pre);
+    w.appendChild(pre);
+    const b = document.createElement('button');
+    b.className = 'cbtn'; b.dataset.lbl = ' copy';
+    b.innerHTML = cpIco + ' copy';
+    b.onclick = () => doCopy(pre.innerText.trimEnd(), b);
+    w.appendChild(b);
+  });
+
+  el.querySelectorAll('table').forEach(table => {
+    if (table.parentElement.classList.contains('table-wrap')) return;
+    const outer = document.createElement('div');
+    outer.className = 'table-outer';
+    table.parentNode.insertBefore(outer, table);
+    const tools = document.createElement('div');
+    tools.className = 'table-tools';
+    outer.appendChild(tools);
+    const w = document.createElement('div');
+    w.className = 'table-wrap';
+    outer.appendChild(w);
+    w.appendChild(table);
+    const b = document.createElement('button');
+    b.className = 'tcbtn';
+    b.title = 'Copy table';
+    b.setAttribute('aria-label', 'Copy table');
+    b.innerHTML = cpIco;
+    b.onclick = () => doCopy(tblPlain(table), b);
+    tools.appendChild(b);
+  });
+}
+
+function addMsgCopy(el, html) {
+  const e = el.querySelector('.mcopy'); if (e) e.remove();
+  const b = document.createElement('button');
+  b.className = 'mcopy'; b.dataset.lbl = ' копировать ответ';
+  b.innerHTML = cpIco + ' копировать ответ';
+  b.onclick = () => doCopy(htmlToReadable(html), b);
+  el.appendChild(b);
+}
+
+// ── markdown ─────────────────────────────────────────────────────────────────
+
+function fixMarkdown(md) {
+  return md.replace(/^```[^\n]*\n([\s\S]*?)^```/gm, (match, inner) => {
+    const lines = inner.trim().split('\n');
+    const isTable = lines.length >= 2
+      && lines[0].trim().startsWith('|')
+      && /^\|[\s|:\-]+\|$/.test(lines[1].trim());
+    return isTable ? inner.trim() : match;
+  });
+}
+
+// ── conversations ─────────────────────────────────────────────────────────────
+
+async function loadConversations() {
+  try {
+    const data = await fetch('/api/conversations').then(r => r.json());
+    renderConvList(data.conversations || []);
+  } catch(e) {
+    console.error(e);
+  }
+}
+
+function renderConvList(convs) {
+  const list = document.getElementById('chats-list');
+  if (!convs.length) {
+    list.innerHTML = '<div class="chats-empty">Нет чатов</div>';
+    return;
+  }
+  list.innerHTML = convs.map(c => `
+    <div class="chat-item ${c.id === currentConvId ? 'active' : ''}" data-id="${c.id}" onclick="openChat('${c.id}')">
+      <div class="chat-item-title">${esc(c.title)}</div>
+      <button class="chat-item-del" onclick="deleteChat(event,'${c.id}')" title="Удалить">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+  `).join('');
+}
+
+async function newChat() {
+  const model = document.getElementById('model-select').value || 'gemma3:4b';
+  const data = await fetch('/api/conversations', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({model})
+  }).then(r => r.json());
+
+  currentConvId = data.id;
+  clearFeed();
+  await loadConversations();
+  highlightActiveChat();
+}
+
+async function openChat(id) {
+  if (isStreaming) return;
+  currentConvId = id;
+  clearFeed();
+  highlightActiveChat();
+
+  const data = await fetch(`/api/conversations/${id}/messages`).then(r => r.json());
+  const msgs = data.messages || [];
+  if (!msgs.length) return;
+
+  hideEmpty();
+  for (const m of msgs) {
+    const ac = addMessage(m.role, m.role === 'user' ? m.content : '', m.file_name || null);
+    if (m.role === 'assistant') {
+      ac.innerHTML = marked.parse(fixMarkdown(m.content));
+      addCodeBtns(ac);
+      addMsgCopy(ac, ac.innerHTML);
+    }
+  }
+  userScrolled = false;
+  scrollEnd(true);
+}
+
+async function deleteChat(e, id) {
+  e.stopPropagation();
+  await fetch(`/api/conversations/${id}`, {method: 'DELETE'});
+  if (currentConvId === id) {
+    currentConvId = null;
+    clearFeed();
+    document.getElementById('empty-state').style.display = '';
+  }
+  loadConversations();
+}
+
+function highlightActiveChat() {
+  document.querySelectorAll('.chat-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.id === currentConvId);
+  });
+}
+
+function clearFeed() {
+  const inner = document.getElementById('chat-inner');
+  inner.innerHTML = '';
+  const welcome = document.createElement('div');
+  welcome.className = 'welcome';
+  welcome.id = 'empty-state';
+  welcome.innerHTML = `
+    <div class="welcome-title">Добрый день</div>
+    <div class="welcome-sub">Загрузите документ или задайте вопрос — анализирую PDF, DOCX, Excel, изображения и другие форматы</div>`;
+  inner.appendChild(welcome);
+}
+
+// ── models ────────────────────────────────────────────────────────────────────
+
+async function loadModels() {
+  try {
+    const d = await fetch('/api/models').then(r => r.json());
+    const models = d.models && d.models.length ? d.models : [{id: 'gemma3:4b', label: 'Базовая'}];
+    _modelMap = {};
+    models.forEach(m => {
+      const id = typeof m === 'string' ? m : m.id;
+      const label = typeof m === 'string' ? m : m.label;
+      _modelMap[id] = label;
+    });
+    renderModelDrop(models);
+    if (models.length) {
+      const first = typeof models[0] === 'string' ? models[0] : models[0].id;
+      selectModel(first);
+    }
+  } catch {
+    document.getElementById('stat-status').textContent = 'Нет соединения';
+    document.getElementById('status-dot').classList.add('off');
+  }
+}
+
+function renderModelDrop(models) {
+  const drop = document.getElementById('model-sel-drop');
+  drop.innerHTML = '';
+  models.forEach(m => {
+    const id = typeof m === 'string' ? m : m.id;
+    const label = typeof m === 'string' ? m : m.label;
+    const opt = document.createElement('div');
+    opt.className = 'csel-opt';
+    opt.dataset.id = id;
+    opt.textContent = label;
+    opt.addEventListener('click', () => { selectModel(id, true); closeDrop(); });
+    drop.appendChild(opt);
+  });
+}
+
+function selectModel(id, userChose = false) {
+  document.getElementById('model-select').value = id;
+  document.getElementById('model-sel-val').textContent = _modelMap[id] || id;
+  document.querySelectorAll('.csel-opt').forEach(opt => {
+    opt.classList.toggle('active', opt.dataset.id === id);
+  });
+  if (userChose) {
+    userOverrodeModel = true;
+    clearAutoModelBadge();
+  }
+}
+
+function toggleDrop() {
+  const drop = document.getElementById('model-sel-drop');
+  const trigger = document.getElementById('model-sel-trigger');
+  const isOpen = drop.classList.toggle('open');
+  trigger.classList.toggle('open', isOpen);
+}
+
+function closeDrop() {
+  document.getElementById('model-sel-drop').classList.remove('open');
+  document.getElementById('model-sel-trigger').classList.remove('open');
+}
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('#model-sel-wrap')) closeDrop();
+});
+
+// ── textarea ──────────────────────────────────────────────────────────────────
+
+const ta = document.getElementById('input-field');
+ta.addEventListener('input', () => {
+  ta.style.height = 'auto';
+  ta.style.height = Math.min(ta.scrollHeight, 180) + 'px';
+});
+ta.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+// ── file handling ─────────────────────────────────────────────────────────────
+
+document.getElementById('file-input').addEventListener('change', e => {
+  if (e.target.files[0]) setFile(e.target.files[0]);
+});
+
+document.addEventListener('paste', e => {
+  const items = (e.clipboardData || e.originalEvent?.clipboardData)?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.kind === 'file') {
+      const f = item.getAsFile();
+      if (f) { setFile(f); showToast('Файл вставлен: ' + f.name); }
+      break;
+    }
+  }
+});
+
+function setFile(f) {
+  currentFile = f;
+  document.getElementById('file-preview-name').textContent = f.name;
+  document.getElementById('file-preview-size').textContent = fmtSize(f.size);
+  document.getElementById('file-preview').classList.add('show');
+  if (autoModelEnabled && !userOverrodeModel) {
+    detectFileAndSelectModel(f);
+  }
+}
+
+async function detectFileAndSelectModel(f) {
+  const ext = '.' + f.name.split('.').pop().toLowerCase();
+  if (ext !== '.pdf') {
+    await autoSelectModel(ext, document.getElementById('input-field').value.trim());
+    return;
+  }
+  try {
+    const fd = new FormData();
+    fd.append('file', f);
+    const data = await fetch('/api/detect-file', { method: 'POST', body: fd }).then(r => r.json());
+    if (data.model && _modelMap[data.model]) {
+      selectModel(data.model);
+      showAutoModelBadge(data.model, data.reason);
+    }
+  } catch(e) {
+    await autoSelectModel(ext, document.getElementById('input-field').value.trim());
+  }
+}
+
+function removeFile() {
+  currentFile = null;
+  document.getElementById('file-input').value = '';
+  document.getElementById('file-preview').classList.remove('show');
+  clearAutoModelBadge();
+}
+
+function fmtSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  return (b/1048576).toFixed(1) + ' MB';
+}
+
+// ── drag & drop ───────────────────────────────────────────────────────────────
+
+let dragN = 0;
+document.addEventListener('dragenter', e => { e.preventDefault(); dragN++; document.getElementById('drop-overlay').classList.add('show'); });
+document.addEventListener('dragleave', e => { dragN--; if (dragN <= 0) { dragN = 0; document.getElementById('drop-overlay').classList.remove('show'); } });
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => {
+  e.preventDefault(); dragN = 0;
+  document.getElementById('drop-overlay').classList.remove('show');
+  const f = e.dataTransfer.files[0];
+  if (f) { setFile(f); showToast('Файл прикреплён: ' + f.name); }
+});
+
+// ── messages ──────────────────────────────────────────────────────────────────
+
+function hideEmpty() {
+  const el = document.getElementById('empty-state');
+  if (el) el.style.display = 'none';
+}
+
+function addMessage(role, content, badge) {
+  hideEmpty();
+  const wrap = document.getElementById('chat-inner');
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  const av = role === 'user'
+    ? `<div class="msg-avatar">↑</div>`
+    : `<div class="msg-avatar"><img src="/ico.png" alt="" style="width:20px;height:20px;object-fit:contain;border-radius:6px;"></div>`;
+  const bd = badge ? `<div class="msg-file-badge">${esc(badge)}</div><br>` : '';
+  div.innerHTML = `${av}<div class="msg-body"><div class="msg-role">${role === 'user' ? 'Вы' : 'БелнипиAI'}</div><div class="msg-content">${bd}${role === 'user' ? esc(content) : ''}</div></div>`;
+  wrap.appendChild(div);
+  return div.querySelector('.msg-content');
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function scrollEnd(force = false) {
+  const a = document.getElementById('chat-area');
+  if (force || !userScrolled) {
+    a.scrollTop = a.scrollHeight;
+  }
+}
+
+// ── stop ──────────────────────────────────────────────────────────────────────
+
+function stopStreaming() {
+  if (abortController) { abortController.abort(); abortController = null; }
+}
+
+// ── send ──────────────────────────────────────────────────────────────────────
+
+async function sendMessage() {
+  if (isStreaming) return;
+  const q = ta.value.trim(); if (!q) return;
+
+  if (autoModelEnabled && !userOverrodeModel && !currentFile) {
+    await autoSelectModel('', q);
+  }
+
+  const model = document.getElementById('model-select').value || 'gemma3:4b';
+  userOverrodeModel = false;
+  clearAutoModelBadge();
+
+  if (!currentConvId) {
+    const data = await fetch('/api/conversations', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model})
+    }).then(r => r.json());
+    currentConvId = data.id;
+    await loadConversations();
+    highlightActiveChat();
+  }
+
+  isStreaming = true;
+  abortController = new AbortController();
+  const btn = document.getElementById('send-btn');
+  btn.classList.add('stop');
+  btn.innerHTML = stopIcon;
+  btn.onclick = stopStreaming;
+  ta.value = ''; ta.style.height = 'auto';
+
+  const fc = currentFile, fn = fc ? fc.name : null;
+  if (fc) removeFile();
+
+  userScrolled = false;
+  addMessage('user', q, fn); scrollEnd(true);
+  const ac = addMessage('assistant', '');
+  const dots = document.createElement('div');
+  dots.className = 'thinking';
+  dots.innerHTML = '<span></span><span></span><span></span>';
+  ac.appendChild(dots); scrollEnd(true);
+
+  const fd = new FormData();
+  fd.append('question', q); fd.append('model', model);
+  if (fc) fd.append('file', fc);
+  if (ragEnabled && !fc) {
+    fd.append('use_rag', 'true');
+    const folderId = document.getElementById('kb-folder-sel').value;
+    if (folderId) fd.append('folder_id', folderId);
+  }
+
+  let raw = '', first = true, pendingSources = null;
+  try {
+    const res = await fetch(`/api/conversations/${currentConvId}/chat`, {
+      method: 'POST', body: fd, signal: abortController.signal
+    });
+    const reader = res.body.getReader(), dec = new TextDecoder();
+    while (true) {
+      const {done, value} = await reader.read(); if (done) break;
+      for (const line of dec.decode(value).split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        const p = line.slice(6); if (p === '[DONE]') break;
+        try {
+          const o = JSON.parse(p);
+          if (o.error) { showToast(o.error, true); break; }
+          if (o.title) {
+            updateChatTitle(currentConvId, o.title);
+          }
+          if (o.sources) {
+            pendingSources = o.sources;
+          }
+          if (o.text) {
+            if (first) { dots.remove(); first = false; }
+            raw += o.text;
+            ac.innerHTML = marked.parse(fixMarkdown(raw)) + '<span class="cursor"></span>';
+            addCodeBtns(ac); scrollEnd();
+          }
+        } catch(e) {}
+      }
+    }
+  } catch(err) {
+    if (first) dots.remove();
+    if (err.name !== 'AbortError') {
+      ac.innerHTML = '<span style="color:var(--red)">Ошибка соединения с сервером</span>';
+      showToast('Ошибка соединения', true);
+    }
+  }
+
+  const cur = ac.querySelector('.cursor'); if (cur) cur.remove();
+  if (first) dots.remove();
+  if (raw) {
+    ac.innerHTML = marked.parse(fixMarkdown(raw));
+    addCodeBtns(ac);
+    if (pendingSources && pendingSources.length) {
+      ac.appendChild(buildSourcesBlock(pendingSources));
+    }
+    addMsgCopy(ac, ac.innerHTML);
+  }
+
+  abortController = null;
+  isStreaming = false;
+  btn.classList.remove('stop');
+  btn.innerHTML = sendIcon;
+  btn.onclick = sendMessage;
+  ta.focus(); scrollEnd();
+}
+
+function updateChatTitle(id, title) {
+  const item = document.querySelector(`.chat-item[data-id="${id}"] .chat-item-title`);
+  if (item) item.textContent = title;
+}
+
+// ── auto model ────────────────────────────────────────────────────────────────
+
+async function autoSelectModel(fileExt, question) {
+  if (!autoModelEnabled) return;
+  try {
+    const data = await fetch('/api/suggest-model', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({file_ext: fileExt, question})
+    }).then(r => r.json());
+
+    if (data.model && _modelMap[data.model]) {
+      selectModel(data.model);
+      showAutoModelBadge(data.model, data.reason);
+    }
+  } catch(e) {}
+}
+
+function showAutoModelBadge(model, reason) {
+  const label = _modelMap[model] || model;
+
+  let badge = document.getElementById('auto-model-badge');
+  if (!badge) {
+    badge = document.createElement('span');
+    badge.id = 'auto-model-badge';
+    document.querySelector('.field-label').appendChild(badge);
+  }
+  badge.className = 'auto-model-badge';
+  badge.title = reason;
+  badge.innerHTML = `<span class="auto-model-label">авто</span><span class="auto-model-name">${esc(label)}</span>`;
+  badge.style.display = 'inline-flex';
+}
+
+function clearAutoModelBadge() {
+  const badge = document.getElementById('auto-model-badge');
+  if (badge) badge.style.display = 'none';
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+function setPrompt(t) { ta.value = t; ta.focus(); ta.dispatchEvent(new Event('input')); }
+
+function showToast(msg, err) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (err ? ' error' : '');
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+// ── current user (SSO) ────────────────────────────────────────────────────────
+
+async function loadCurrentUser() {
+  try {
+    const data = await fetch('/api/me').then(r => r.json());
+    const login = (data.username || '').trim();
+    const display = (data.display_name || '').trim();
+    const userEl = document.getElementById('current-user');
+    if (!userEl) return;
+    if (login || display) {
+      userEl.textContent = login ? `@${login}` : display;
+      userEl.title = display && login ? `${display} (${login})` : (display || login);
+    } else {
+      userEl.textContent = 'Гость';
+      userEl.title = 'Гость';
+    }
+  } catch (e) {
+    const userEl = document.getElementById('current-user');
+    if (userEl) { userEl.textContent = 'Гость'; userEl.title = 'Гость'; }
+  }
+}
+
+// ── nav collapse ──────────────────────────────────────────────────────────────
+
+function collapseNav() {
+  document.querySelector('.shell').classList.add('nav-collapsed');
+  document.querySelector('.nav').classList.add('collapsed');
+  localStorage.setItem('navCollapsed', 'true');
+}
+
+function toggleNav() {
+  const shell = document.querySelector('.shell');
+  const nav = document.querySelector('.nav');
+  const isNowCollapsed = shell.classList.toggle('nav-collapsed');
+  nav.classList.toggle('collapsed', isNowCollapsed);
+  localStorage.setItem('navCollapsed', isNowCollapsed ? 'true' : 'false');
+}
+
+function initNavState() {
+  const saved = localStorage.getItem('navCollapsed');
+  const isSmall = window.innerWidth < 900;
+  const shouldCollapse = saved === 'true' || (saved === null && isSmall);
+  if (shouldCollapse) collapseNav();
+}
+
+let _lastInnerWidth = window.innerWidth;
+window.addEventListener('resize', () => {
+  const w = window.innerWidth;
+  if (w < _lastInnerWidth && !document.querySelector('.shell').classList.contains('nav-collapsed')) {
+    collapseNav();
+  }
+  _lastInnerWidth = w;
+});
+
+// ── delete all chats ──────────────────────────────────────────────────────────
+
+async function deleteAllChats() {
+  const items = document.querySelectorAll('.chat-item');
+  if (!items.length) return;
+  if (!confirm('Удалить все чаты? Это действие нельзя отменить.')) return;
+  const ids = Array.from(items).map(el => el.dataset.id);
+  await Promise.all(ids.map(id => fetch(`/api/conversations/${id}`, { method: 'DELETE' })));
+  currentConvId = null;
+  clearFeed();
+  loadConversations();
+  showToast('Все чаты удалены');
+}
+
+// ── RAG toggle ────────────────────────────────────────────────────────────────
+
+let ragEnabled = false;
+
+function toggleRag() {
+  ragEnabled = !ragEnabled;
+  const btn = document.getElementById('rag-toggle');
+  btn.classList.toggle('active', ragEnabled);
+  btn.title = ragEnabled ? 'Отключить поиск по базе знаний' : 'Поиск по базе знаний';
+}
+
+// ── Источники RAG ─────────────────────────────────────────────────────────────
+
+function buildSourcesBlock(sources) {
+  const wrap = document.createElement('div');
+  wrap.className = 'rag-sources';
+
+  const summary = document.createElement('div');
+  summary.className = 'rag-sources-toggle';
+  summary.innerHTML = `
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <ellipse cx="12" cy="5" rx="9" ry="3"/>
+      <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+      <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+    </svg>
+    Источники (${sources.length})
+    <span class="rag-sources-arr">▾</span>`;
+  summary.onclick = () => {
+    const list = wrap.querySelector('.rag-sources-list');
+    const arr  = wrap.querySelector('.rag-sources-arr');
+    const open = list.style.display !== 'none';
+    list.style.display = open ? 'none' : 'flex';
+    arr.textContent = open ? '▾' : '▴';
+  };
+
+  const list = document.createElement('div');
+  list.className = 'rag-sources-list';
+  list.style.display = 'none';
+
+  sources.forEach((s, i) => {
+    const card = document.createElement('div');
+    card.className = 'rag-source-card';
+    const pct = Math.round(s.score * 100);
+    const page = s.page ? `, стр. ${s.page}` : '';
+    card.innerHTML = `
+      <div class="rag-src-num">${i + 1}</div>
+      <div class="rag-src-info">
+        <div class="rag-src-name">${esc(s.name)}${page}</div>
+        <div class="rag-src-bar"><div class="rag-src-fill" style="width:${pct}%"></div></div>
+      </div>
+      <div class="rag-src-score">${pct}%</div>`;
+    list.appendChild(card);
+  });
+
+  wrap.appendChild(summary);
+  wrap.appendChild(list);
+  return wrap;
+}
+
+// ── Вкладки nav ───────────────────────────────────────────────────────────────
+
+function switchTab(name) {
+  document.getElementById('panel-chats').style.display = name === 'chats' ? 'flex' : 'none';
+  document.getElementById('panel-kb').style.display    = name === 'kb'    ? 'flex' : 'none';
+  document.getElementById('tab-btn-chats').classList.toggle('active', name === 'chats');
+  document.getElementById('tab-btn-kb').classList.toggle('active',    name === 'kb');
+  if (name === 'kb') loadKbFolders();
+}
+
+// ── База знаний: папки ────────────────────────────────────────────────────────
+
+async function loadKbFolders() {
+  try {
+    const data = await fetch('/api/kb/folders').then(r => r.json());
+    const sel  = document.getElementById('kb-folder-sel');
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">Все документы</option>';
+    (data.folders || []).forEach(f => {
+      const o = document.createElement('option');
+      o.value = f.id; o.textContent = f.name;
+      sel.appendChild(o);
+    });
+    if (prev) sel.value = prev;
+    loadKbDocuments(sel.value || null);
+  } catch(e) {
+    console.error(e);
+  }
+}
+
+async function promptCreateFolder() {
+  const name = prompt('Название папки:');
+  if (!name || !name.trim()) return;
+  try {
+    await fetch('/api/kb/folders', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name.trim()}),
+    });
+    loadKbFolders();
+    showToast('Папка создана');
+  } catch(e) {
+    showToast('Ошибка создания папки', true);
+  }
+}
+
+function onKbFolderChange() {
+  const fid = document.getElementById('kb-folder-sel').value || null;
+  loadKbDocuments(fid);
+}
+
+// ── База знаний: документы ────────────────────────────────────────────────────
+
+let _kbPollTimers = {};
+
+async function loadKbDocuments(folderId) {
+  try {
+    const url  = folderId ? `/api/kb/documents?folder_id=${folderId}` : '/api/kb/documents';
+    const data = await fetch(url).then(r => r.json());
+    renderKbDocs(data.documents || []);
+  } catch(e) {
+    console.error(e);
+  }
+}
+
+function renderKbDocs(docs) {
+  const list = document.getElementById('kb-docs-list');
+  if (!docs.length) {
+    list.innerHTML = '<div class="chats-empty">Нет документов</div>';
+    return;
+  }
+  list.innerHTML = '';
+  docs.forEach(d => list.appendChild(buildKbDocItem(d)));
+
+  docs.forEach(d => {
+    if (d.status === 'pending' || d.status === 'indexing') {
+      pollDocStatus(d.id);
+    }
+  });
+}
+
+function buildKbDocItem(doc) {
+  const div = document.createElement('div');
+  div.className = 'kb-doc-item';
+  div.id = `kb-doc-${doc.id}`;
+
+  const statusMap = {
+    pending:  {cls: 'kb-status-pending',  label: 'Ожидание'},
+    indexing: {cls: 'kb-status-indexing', label: 'Индексация...'},
+    indexed:  {cls: 'kb-status-indexed',  label: `${doc.chunk_count} чанков`},
+    error:    {cls: 'kb-status-error',    label: 'Ошибка'},
+  };
+  const st = statusMap[doc.status] || statusMap.error;
+
+  div.innerHTML = `
+    <div class="kb-doc-icon">${docIcon(doc.original_name)}</div>
+    <div class="kb-doc-info">
+      <div class="kb-doc-name">${esc(doc.original_name)}</div>
+      <div class="kb-doc-meta ${st.cls}">${st.label}</div>
+    </div>
+    <button class="kb-doc-del" onclick="deleteKbDoc('${doc.id}')" title="Удалить">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>`;
+  return div;
+}
+
+function docIcon(name) {
+  const ext = name.split('.').pop().toLowerCase();
+  const icons = {
+    pdf:  '📄', docx: '📝', doc: '📝',
+    xlsx: '📊', xls:  '📊', xlsm: '📊',
+    csv:  '📋', tsv:  '📋', txt:  '📃', md: '📃',
+  };
+  return icons[ext] || '📁';
+}
+
+async function pollDocStatus(docId) {
+  if (_kbPollTimers[docId]) return;
+  _kbPollTimers[docId] = setInterval(async () => {
+    try {
+      const d = await fetch(`/api/kb/documents/${docId}`).then(r => r.json());
+      const el = document.getElementById(`kb-doc-${docId}`);
+      if (el) {
+        const newEl = buildKbDocItem(d);
+        el.replaceWith(newEl);
+      }
+      if (d.status === 'indexed' || d.status === 'error') {
+        clearInterval(_kbPollTimers[docId]);
+        delete _kbPollTimers[docId];
+        if (d.status === 'indexed') showToast(`Проиндексировано: ${d.original_name}`);
+        if (d.status === 'error')   showToast(`Ошибка индексации: ${d.original_name}`, true);
+      }
+    } catch(e) {
+      clearInterval(_kbPollTimers[docId]);
+      delete _kbPollTimers[docId];
+    }
+  }, 3000);
+}
+
+async function onKbFileSelected(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  event.target.value = '';
+
+  const folderId = document.getElementById('kb-folder-sel').value || null;
+  const fd = new FormData();
+  fd.append('file', file);
+  if (folderId) fd.append('folder_id', folderId);
+
+  showToast(`Загружаю: ${file.name}`);
+  try {
+    const data = await fetch('/api/kb/upload', {method: 'POST', body: fd}).then(r => r.json());
+    if (data.error) { showToast(data.error, true); return; }
+    showToast('Файл загружен, начинаю индексацию...');
+    loadKbDocuments(folderId);
+  } catch(e) {
+    showToast('Ошибка загрузки', true);
+  }
+}
+
+async function deleteKbDoc(docId) {
+  if (!confirm('Удалить документ из базы знаний?')) return;
+  try {
+    await fetch(`/api/kb/documents/${docId}`, {method: 'DELETE'});
+    clearInterval(_kbPollTimers[docId]);
+    delete _kbPollTimers[docId];
+    const fid = document.getElementById('kb-folder-sel').value || null;
+    loadKbDocuments(fid);
+    showToast('Документ удалён');
+  } catch(e) {
+    showToast('Ошибка удаления', true);
+  }
+}
+
+// ── init ──────────────────────────────────────────────────────────────────────
+
+marked.use({ gfm: true });
+initNavState();
+loadModels();
+loadConversations();
+loadCurrentUser();
+ta.focus();
+
+// Останавливаем автоскролл если пользователь уходит вверх
+document.getElementById('chat-area').addEventListener('scroll', () => {
+  const a = document.getElementById('chat-area');
+  userScrolled = a.scrollHeight - a.scrollTop - a.clientHeight > 80;
+});

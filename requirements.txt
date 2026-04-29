@@ -1,0 +1,10 @@
+flask>=3.0
+psycopg2-binary
+pgvector>=0.3.0
+ollama
+pymupdf
+pdf2image
+python-docx
+pandas
+openpyxl
+xlrd

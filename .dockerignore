@@ -1,0 +1,7 @@
+ollama-data/
+pg_data/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.env

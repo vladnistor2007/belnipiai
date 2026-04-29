@@ -1,0 +1,68 @@
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: postgres-lens
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: sdd05072008sdd
+      POSTGRES_DB: belnipiai
+    volumes:
+      - ./pg_data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    networks:
+      - ai-stack
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    volumes:
+      - ./ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - CUDA_VISIBLE_DEVICES=0
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - ai-stack
+
+  lens:
+    build: .
+    container_name: lens
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - MODEL_DEFAULT=qwen3:14b
+      - DATABASE_URL=postgresql://postgres:sdd05072008sdd@postgres:5432/belnipiai
+      - EMBED_MODEL=nomic-embed-text
+      - AI_FLASK_SECRET=change-this-to-random-secret
+      - AI_SSO_SHARED_SECRET=change-this-to-sso-secret
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    networks:
+      - ai-stack
+
+networks:
+  ai-stack:
+    driver: bridge
