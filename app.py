@@ -17,9 +17,12 @@ import ollama
 from rag_engine import (
     index_document as rag_index_document,
     hybrid_search,
+    expand_with_neighbors,
+    build_context_chunks,
+    fetch_all_context_pages,
     build_rag_context,
 )
-from rag_chunker import chunk_text as rag_chunk_text, chunk_pages as rag_chunk_pages
+from rag_chunker import chunk_text as rag_chunk_text, chunk_pages as rag_chunk_pages, chunk_excel as rag_chunk_excel
 
 app = Flask(__name__, static_folder="static")
 ROOT_DIR = app.root_path
@@ -37,6 +40,7 @@ AI_SSO_MAX_AGE_SEC = int(os.environ.get("AI_SSO_MAX_AGE_SEC", "300"))
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:sdd05072008sdd@localhost:5432/belnipiai")
+KB_FULL_ANALYSIS_MAX_CHUNKS = int(os.environ.get("KB_FULL_ANALYSIS_MAX_CHUNKS", "2000"))
 
 _client = ollama.Client(host=OLLAMA_HOST)
 
@@ -150,11 +154,11 @@ SYSTEM_PROMPT_CHAT = (
 
 SYSTEM_PROMPT_RAG = (
     "You are an expert assistant working with enterprise documents. "
-    "Answer ONLY based on the provided context retrieved from the knowledge base. "
-    "For every fact or claim, cite the source like this: [Источник N]. "
-    "If the answer cannot be found in the context, respond exactly: "
-    "'В базе знаний нет информации по этому вопросу.' "
-    "Never invent facts. Format your response in Markdown."
+    "Answer based on the provided context from the knowledge base. "
+    "Be concise: match the answer length to the question — simple questions get short answers, complex ones get detailed answers. "
+    "Use inline citations like [Источник N] only where needed — do NOT add a sources list or bibliography at the end. "
+    "If no relevant information is found, say: 'В базе знаний не найдено информации по данному вопросу.' "
+    "Never invent facts. Answer in the same language as the question. Format your response in Markdown."
 )
 
 
@@ -318,6 +322,38 @@ def load_history_with_summary(conv_id: str, num_ctx: int) -> list:
     return messages
 
 
+def compact_history_for_rag(history: list, max_messages: int = 8,
+                            max_chars: int = 1600) -> list:
+    compact = []
+    for msg in history[-max_messages:]:
+        content = msg.get("content", "")
+        if "<document name=" in content:
+            content = re.sub(
+                r"<document name=\"([^\"]+)\">.*?</document>",
+                r"[Документ в истории: \1]",
+                content,
+                flags=re.S,
+            )
+        if len(content) > max_chars:
+            content = content[:max_chars] + "\n\n[... история обрезана ...]"
+        compact.append({"role": msg.get("role", "user"), "content": content})
+    return compact
+
+
+def is_full_kb_analysis(question: str) -> bool:
+    q = question.lower()
+    broad_markers = (
+        "все файлы", "все документы", "всю базу", "базу знаний",
+        "полностью", "целиком", "по всем файлам", "по всем документам",
+        "проанализируй все", "анализ всех", "сравни все",
+    )
+    analysis_markers = (
+        "проанализ", "анализ", "сравни", "сводк", "вывод",
+        "найди", "проверь", "обобщ", "резюм",
+    )
+    return any(m in q for m in broad_markers) and any(m in q for m in analysis_markers)
+
+
 def maybe_summarize(conv_id: str, model: str, num_ctx: int):
     """Если история занимает > 65% контекста — делаем резюме (вызывается из фонового треда)."""
     with get_db() as conn:
@@ -478,12 +514,99 @@ def read_docx(path):
 def read_excel(path):
     import pandas as pd
     ext = os.path.splitext(path)[1].lower()
-    xf = pd.ExcelFile(path, engine="xlrd" if ext == ".xls" else "openpyxl")
     parts = []
-    for sheet in xf.sheet_names:
-        df = xf.parse(sheet)
-        parts.append(f"[Лист: {sheet}]\n{df.to_string()}")
+    with pd.ExcelFile(path, engine="xlrd" if ext == ".xls" else "openpyxl") as xf:
+        for sheet in xf.sheet_names:
+            df = xf.parse(sheet)
+            parts.append(f"[Лист: {sheet}]\n{df.to_string()}")
     return "\n\n".join(parts)
+
+
+def read_excel_sheets(path: str) -> list[dict]:
+    """Return structured sheet data for RAG chunking (not flattened to string)."""
+    import pandas as pd
+
+    def is_empty(v) -> bool:
+        try:
+            if pd.isna(v):
+                return True
+        except Exception:
+            pass
+        return str(v).strip() == ""
+
+    def clean_cell(v) -> str:
+        return "" if is_empty(v) else str(v).strip()
+
+    def dedupe_headers(headers: list[str]) -> list[str]:
+        seen = {}
+        out = []
+        for i, h in enumerate(headers, 1):
+            base = h.strip() or f"Колонка {i}"
+            seen[base] = seen.get(base, 0) + 1
+            out.append(base if seen[base] == 1 else f"{base} {seen[base]}")
+        return out
+
+    def infer_header_row(df) -> int | None:
+        candidates = list(df.index[: min(len(df.index), 25)])
+        best_idx = None
+        best_score = -1.0
+        for idx in candidates:
+            vals = [clean_cell(v) for v in df.loc[idx].tolist()]
+            non_empty = [v for v in vals if v]
+            if not non_empty:
+                continue
+            text_like = sum(1 for v in non_empty if any(ch.isalpha() for ch in v))
+            unique = len(set(non_empty))
+            numeric_like = sum(1 for v in non_empty if v.replace(".", "", 1).isdigit())
+            next_rows = df.loc[df.index[df.index.get_loc(idx) + 1: df.index.get_loc(idx) + 4]]
+            has_data_after = not next_rows.dropna(how="all").empty
+            score = len(non_empty) + text_like * 0.7 + unique * 0.2 - numeric_like * 0.35
+            if has_data_after:
+                score += 1.5
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        return best_idx
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".xls":
+        engine = "xlrd"
+    elif ext == ".ods":
+        engine = "odf"
+    else:
+        engine = "openpyxl"
+    sheets = []
+    with pd.ExcelFile(path, engine=engine) as xf:
+        for sheet_name in xf.sheet_names:
+            raw = xf.parse(sheet_name, header=None, dtype=object)
+            raw = raw.dropna(how="all").dropna(axis=1, how="all")
+            if raw.empty:
+                continue
+            header_idx = infer_header_row(raw)
+            if header_idx is None:
+                headers = [f"Колонка {i+1}" for i in range(raw.shape[1])]
+                data = raw
+            else:
+                headers = dedupe_headers([clean_cell(v) for v in raw.loc[header_idx].tolist()])
+                data = raw.loc[raw.index[raw.index.get_loc(header_idx) + 1:]]
+            data = data.dropna(how="all")
+            rows = []
+            for idx, row in data.iterrows():
+                values = row.tolist()
+                if all(is_empty(v) for v in values):
+                    continue
+                rows.append({
+                    "row_number": int(idx) + 1,
+                    "values": values,
+                })
+            if not rows:
+                continue
+            sheets.append({
+                "name":    sheet_name,
+                "headers": headers,
+                "rows":    rows,
+            })
+    return sheets
 
 
 def read_csv(path, ext=".csv"):
@@ -710,9 +833,38 @@ def api_chat(conv_id):
         try:
             if not tmp_path:
                 if use_rag:
-                    rag_chunks = hybrid_search(question, top_k=10, folder_id=folder_id)
+                    rag_history = compact_history_for_rag(history)
+                    if is_full_kb_analysis(question):
+                        pages, total_chunks = fetch_all_context_pages(
+                            folder_id=folder_id,
+                            max_chunks=KB_FULL_ANALYSIS_MAX_CHUNKS,
+                        )
+                        if pages:
+                            if total_chunks > len(pages):
+                                yield f"data: {json.dumps({'text': f'База знаний очень большая: обрабатываю первые {len(pages)} из {total_chunks} чанков. Увеличить лимит можно через KB_FULL_ANALYSIS_MAX_CHUNKS.\\n\\n'})}\n\n"
+                            gen = stream_map_reduce(pages, question, model, rag_history)
+                            for chunk in gen:
+                                if chunk.startswith("data: ") and chunk != "data: [DONE]\n\n":
+                                    try:
+                                        full_response.append(json.loads(chunk[6:]).get("text", ""))
+                                    except Exception:
+                                        pass
+                                yield chunk
+                            return
+
+                    reserved_tokens = (
+                        estimate_tokens(question)
+                        + sum(estimate_tokens(m["content"]) for m in rag_history)
+                        + 4500
+                    )
+                    rag_budget = max(6000, int(profile["num_ctx"] * 0.90) - reserved_tokens)
+                    rag_chunks = build_context_chunks(
+                        question,
+                        folder_id=folder_id,
+                        max_tokens=rag_budget,
+                    )
                     if rag_chunks:
-                        rag_context = build_rag_context(rag_chunks)
+                        rag_context = build_rag_context(rag_chunks, max_tokens=rag_budget)
                         sources = [
                             {
                                 "name":  c["original_name"],
@@ -723,7 +875,7 @@ def api_chat(conv_id):
                         ]
                         yield f"data: {json.dumps({'sources': sources})}\n\n"
                         messages = [{"role": "system", "content": SYSTEM_PROMPT_RAG}]
-                        messages += history
+                        messages += rag_history
                         messages.append({
                             "role": "user",
                             "content": (
@@ -1007,7 +1159,7 @@ def api_kb_upload():
 
     threading.Thread(
         target=_index_document_async,
-        args=(str(doc_id), tmp_path, ext),
+        args=(str(doc_id), tmp_path, ext, file.filename),
         daemon=True,
     ).start()
 
@@ -1028,16 +1180,16 @@ def api_kb_search():
     data      = request.get_json(force=True)
     query     = (data.get("query") or "").strip()
     folder_id = data.get("folder_id")
-    top_k     = int(data.get("top_k", 5))
+    top_k     = int(data.get("top_k", 30))
     if not query:
         return {"results": []}
     results = hybrid_search(query, top_k=top_k, folder_id=folder_id)
-    return {"results": results}
+    return {"results": expand_with_neighbors(results)}
 
 
 # ── Фоновая индексация ────────────────────────────────────────────────────────
 
-def _index_document_async(doc_id: str, tmp_path: str, ext: str):
+def _index_document_async(doc_id: str, tmp_path: str, ext: str, original_name: str = ""):
     try:
         if ext in (".txt", ".md", ".log"):
             text   = read_txt(tmp_path)
@@ -1069,8 +1221,8 @@ def _index_document_async(doc_id: str, tmp_path: str, ext: str):
             chunks = list(rag_chunk_text(text))
 
         elif ext in (".xlsx", ".xls", ".xlsm", ".ods"):
-            text   = read_excel(tmp_path)
-            chunks = list(rag_chunk_text(text))
+            sheets = read_excel_sheets(tmp_path)
+            chunks = list(rag_chunk_excel(sheets, source_name=original_name))
 
         elif ext in (".csv", ".tsv"):
             text   = read_csv(tmp_path, ext)

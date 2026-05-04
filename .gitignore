@@ -15,6 +15,8 @@ env/
 uploads/
 *.db
 *.sqlite3
+pg_data/
+ollama_data/
 
 # Env / secrets
 .env

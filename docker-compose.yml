@@ -20,28 +20,6 @@ services:
       timeout: 5s
       retries: 5
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    restart: unless-stopped
-    volumes:
-      - ./ollama_data:/root/.ollama
-    ports:
-      - "11434:11434"
-    environment:
-      - OLLAMA_KEEP_ALIVE=24h
-      - CUDA_VISIBLE_DEVICES=0
-    runtime: nvidia
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    networks:
-      - ai-stack
-
   lens:
     build: .
     container_name: lens
@@ -49,7 +27,7 @@ services:
     ports:
       - "5000:5000"
     environment:
-      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_HOST=http://host.docker.internal:11434
       - MODEL_DEFAULT=qwen3:14b
       - DATABASE_URL=postgresql://postgres:sdd05072008sdd@postgres:5432/belnipiai
       - EMBED_MODEL=nomic-embed-text
@@ -58,8 +36,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      ollama:
-        condition: service_started
     networks:
       - ai-stack
 

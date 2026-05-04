@@ -1,5 +1,6 @@
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 CREATE EXTENSION IF NOT EXISTS "vector";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
 
 CREATE TABLE IF NOT EXISTS conversations (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -70,10 +71,12 @@ CREATE TABLE IF NOT EXISTS doc_chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_doc     ON doc_chunks(document_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_doc_idx ON doc_chunks(document_id, chunk_index);
 CREATE INDEX IF NOT EXISTS idx_chunks_tsv     ON doc_chunks USING GIN(content_tsv);
+CREATE INDEX IF NOT EXISTS idx_chunks_content_trgm ON doc_chunks USING GIN(content gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_kb_docs_folder ON kb_documents(folder_id);
 CREATE INDEX IF NOT EXISTS idx_kb_docs_status ON kb_documents(status);
+CREATE INDEX IF NOT EXISTS idx_kb_docs_type   ON kb_documents(doc_type);
 
--- HNSW-индекс создаётся отдельно после первой загрузки данных:
--- CREATE INDEX idx_chunks_vector ON doc_chunks
---   USING hnsw(embedding vector_cosine_ops) WITH (m=16, ef_construction=64);
+CREATE INDEX IF NOT EXISTS idx_chunks_vector_hnsw ON doc_chunks
+  USING hnsw(embedding vector_cosine_ops) WITH (m=16, ef_construction=96);

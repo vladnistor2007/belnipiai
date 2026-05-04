@@ -8,3 +8,4 @@ python-docx
 pandas
 openpyxl
 xlrd
+odfpy

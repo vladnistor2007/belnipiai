@@ -141,16 +141,47 @@ function addMsgCopy(el, html) {
   el.appendChild(b);
 }
 
-// ── markdown ─────────────────────────────────────────────────────────────────
+// ── markdown + math ───────────────────────────────────────────────────────────
 
-function fixMarkdown(md) {
-  return md.replace(/^```[^\n]*\n([\s\S]*?)^```/gm, (match, inner) => {
+function parseMd(md) {
+  // Extract math blocks BEFORE marked sees them — marked mangles LaTeX
+  // underscores and backslashes otherwise.
+  const maths = [];
+  const ph = (i) => `\x02MATH${i}\x03`;
+
+  // Block math $$...$$
+  md = md.replace(/\$\$([\s\S]+?)\$\$/g, (_, tex) => {
+    maths.push({ tex: tex.trim(), display: true });
+    return ph(maths.length - 1);
+  });
+  // Inline math $...$ — non-space at boundaries avoids matching bare $ prices
+  md = md.replace(/\$([^\s$][^$\n]*?[^\s$]|\S)\$/g, (_, tex) => {
+    maths.push({ tex: tex.trim(), display: false });
+    return ph(maths.length - 1);
+  });
+
+  // Unwrap tables accidentally fenced in code blocks
+  md = md.replace(/^```[^\n]*\n([\s\S]*?)^```/gm, (match, inner) => {
     const lines = inner.trim().split('\n');
     const isTable = lines.length >= 2
       && lines[0].trim().startsWith('|')
       && /^\|[\s|:\-]+\|$/.test(lines[1].trim());
     return isTable ? inner.trim() : match;
   });
+
+  let html = marked.parse(md);
+
+  // Restore math as KaTeX-rendered HTML
+  html = html.replace(/\x02MATH(\d+)\x03/g, (_, i) => {
+    const { tex, display } = maths[Number(i)];
+    try {
+      return katex.renderToString(tex, { displayMode: display, throwOnError: false, output: 'html' });
+    } catch (e) {
+      return `<code>${tex}</code>`;
+    }
+  });
+
+  return html;
 }
 
 // ── conversations ─────────────────────────────────────────────────────────────
@@ -208,7 +239,7 @@ async function openChat(id) {
   for (const m of msgs) {
     const ac = addMessage(m.role, m.role === 'user' ? m.content : '', m.file_name || null);
     if (m.role === 'assistant') {
-      ac.innerHTML = marked.parse(fixMarkdown(m.content));
+      ac.innerHTML = parseMd(m.content);
       addCodeBtns(ac);
       addMsgCopy(ac, ac.innerHTML);
     }
@@ -484,7 +515,7 @@ async function sendMessage() {
     if (folderId) fd.append('folder_id', folderId);
   }
 
-  let raw = '', first = true, pendingSources = null;
+  let raw = '', first = true;
   try {
     const res = await fetch(`/api/conversations/${currentConvId}/chat`, {
       method: 'POST', body: fd, signal: abortController.signal
@@ -501,13 +532,15 @@ async function sendMessage() {
           if (o.title) {
             updateChatTitle(currentConvId, o.title);
           }
-          if (o.sources) {
-            pendingSources = o.sources;
+          if (o.sources && o.sources.length) {
+            // Show sources immediately — don't wait for LLM to finish
+            ac.parentElement.appendChild(buildSourcesBlock(o.sources));
+            scrollEnd();
           }
           if (o.text) {
             if (first) { dots.remove(); first = false; }
             raw += o.text;
-            ac.innerHTML = marked.parse(fixMarkdown(raw)) + '<span class="cursor"></span>';
+            ac.innerHTML = parseMd(raw) + '<span class="cursor"></span>';
             addCodeBtns(ac); scrollEnd();
           }
         } catch(e) {}
@@ -524,11 +557,8 @@ async function sendMessage() {
   const cur = ac.querySelector('.cursor'); if (cur) cur.remove();
   if (first) dots.remove();
   if (raw) {
-    ac.innerHTML = marked.parse(fixMarkdown(raw));
+    ac.innerHTML = parseMd(raw);
     addCodeBtns(ac);
-    if (pendingSources && pendingSources.length) {
-      ac.appendChild(buildSourcesBlock(pendingSources));
-    }
     addMsgCopy(ac, ac.innerHTML);
   }
 
