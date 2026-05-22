@@ -4,8 +4,10 @@ pgvector>=0.3.0
 ollama
 pymupdf
 pdf2image
+Pillow
 python-docx
 pandas
 openpyxl
 xlrd
 odfpy
+fpdf2

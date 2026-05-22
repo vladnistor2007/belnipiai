@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import difflib
 import base64
 import json
 import time
@@ -10,17 +11,27 @@ import tempfile
 import uuid
 import threading
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, Response, send_from_directory, stream_with_context, session, redirect, jsonify
-import psycopg2
-import psycopg2.extras
 import ollama
 from rag_engine import (
+    get_db,
     index_document as rag_index_document,
+    invalidate_kb_caches,
     hybrid_search,
     expand_with_neighbors,
     build_context_chunks,
     fetch_all_context_pages,
     build_rag_context,
+)
+from doc_generator import (
+    SYSTEM_PROMPT_DOCGEN,
+    is_document_request,
+    detect_format,
+    make_output_path,
+    extract_code,
+    run_code,
+    TEMP_DIR as DOC_TEMP_DIR,
 )
 from rag_chunker import chunk_text as rag_chunk_text, chunk_pages as rag_chunk_pages, chunk_excel as rag_chunk_excel
 
@@ -161,6 +172,31 @@ SYSTEM_PROMPT_RAG = (
     "Never invent facts. Answer in the same language as the question. Format your response in Markdown."
 )
 
+SYSTEM_PROMPT_COMPARE = (
+    "Ты — эксперт по проверке документов. Сравни каждую КОПИЮ с ОРИГИНАЛОМ.\n\n"
+    "Данные представлены абзацами: сначала полный текст абзаца, затем его параметры форматирования.\n\n"
+    "НАЙДИ ВСЕ РАСХОЖДЕНИЯ двух видов:\n\n"
+    "### 1. ТЕКСТ (самое важное)\n"
+    "- Удалённый текст: абзацы или фрагменты, которые есть в оригинале, но отсутствуют в копии\n"
+    "- Добавленный текст: есть в копии, нет в оригинале\n"
+    "- Изменённый текст: слова заменены, переставлены, опечатки, другая формулировка\n"
+    "- Структурные изменения: абзацы объединены или разбиты\n\n"
+    "### 2. ФОРМАТИРОВАНИЕ\n"
+    "- Поля страницы (верх/низ/лево/право в см)\n"
+    "- Шрифт: название, размер (pt), начертание (жирный/курсив/подчёркнутый)\n"
+    "- Отступы: красная строка, левый отступ (в см)\n"
+    "- Выравнивание: слева / по центру / справа / по ширине\n"
+    "- Межстрочный интервал и интервалы до/после абзаца\n\n"
+    "ФОРМАТ ОТВЕТА для каждой копии:\n"
+    "## Копия N — «имя файла»\n"
+    "### Текстовые расхождения\n"
+    "- **[Тип]** Абзац X: оригинал → «...» / копия → «...»\n"
+    "### Расхождения форматирования\n"
+    "- **[Параметр]** Абзац X: оригинал → копия\n\n"
+    "Если расхождений нет — пиши: '✅ Документ полностью соответствует оригиналу'.\n"
+    "Будь точным: цитируй реальный текст из данных. Не придумывай."
+)
+
 
 def get_profile(model: str) -> dict:
     if model in MODEL_PROFILES:
@@ -200,11 +236,6 @@ def count_tokens(text: str, model: str = MODEL_DEFAULT) -> int:
 
 
 # ── база данных ───────────────────────────────────────────────────────────────
-
-def get_db():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-    return conn
-
 
 def init_db():
     schema = os.path.join(ROOT_DIR, "schema.sql")
@@ -390,14 +421,14 @@ def maybe_summarize(conv_id: str, model: str, num_ctx: int):
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO messages (conversation_id, role, content, token_count) VALUES (%s, 'summary', %s, %s)",
-                (conv_id, summary_text, count_tokens(summary_text, model))
+                (conv_id, summary_text, estimate_tokens(summary_text))
             )
         conn.commit()
 
 
 def save_message(conv_id: str, role: str, content: str, model: str = MODEL_DEFAULT,
                  attachment_name: str = None, attachment_text: str = None):
-    tokens = count_tokens(content, model)
+    tokens = estimate_tokens(content)
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -494,6 +525,24 @@ def read_pdf_text(path):
         if text.strip():
             pages.append(f"[Страница {i+1}]\n{text}")
     return pages
+
+
+def read_scanned_pdf_as_text(path: str, model: str, profile: dict) -> str:
+    from pdf2image import convert_from_path
+    pil_pages = convert_from_path(path, dpi=200)
+    page_texts = []
+    for i, pil_page in enumerate(pil_pages):
+        b64 = to_base64(pil_page)
+        r = _client.chat(
+            model=model,
+            messages=[{"role": "user",
+                       "content": f"Извлеки весь текст со страницы {i+1}.",
+                       "images": [b64]}],
+            options={"num_ctx": profile["num_ctx"], "temperature": 0.0},
+            stream=False,
+        )
+        page_texts.append(f"[Страница {i+1}]\n{r['message']['content']}")
+    return "\n\n".join(page_texts)
 
 
 def read_docx(path):
@@ -678,23 +727,33 @@ def stream_map_reduce(pages_text, question, model, history=None):
         chunks.append("\n\n".join(current))
 
     total = len(chunks)
-    yield f"data: {json.dumps({'text': f'📦 Документ большой — обрабатываю {total} частей...\\n\\n'})}\n\n"
 
-    summaries, prev_context = [], ""
-    for i, chunk in enumerate(chunks):
-        yield f"data: {json.dumps({'text': f'⏳ Часть {i+1}/{total}...\\n'})}\n\n"
-        context_hint = f"\n\nКонтекст из предыдущих частей:\n{prev_context}\n" if prev_context else ""
+    if total == 1:
+        yield from stream_text_response(chunks[0], question, model, history)
+        return
+
+    yield f"data: {json.dumps({'text': f'📦 Документ большой — обрабатываю {total} частей параллельно...\\n\\n'})}\n\n"
+
+    def process_chunk(i, chunk):
         prompt = apply_no_think(
-            f"Это часть {i+1} из {total} документа.\nВопрос: {question}{context_hint}\n"
+            f"Это часть {i+1} из {total} документа.\nВопрос: {question}\n"
             f"Извлеки всё относящееся к вопросу, сохрани детали, цифры, имена:\n\n{chunk}", model
         )
         s = ""
-        for chunk_r in _client.chat(model=model,
-                                     messages=[{"role": "user", "content": prompt}],
-                                     options={"num_ctx": num_ctx, "temperature": 0.1}, stream=True):
-            s += chunk_r["message"]["content"]
-        summaries.append(f"[Часть {i+1}/{total}]\n{s}")
-        prev_context = s[-500:] if len(s) > 500 else s
+        for r in _client.chat(model=model,
+                               messages=[{"role": "user", "content": prompt}],
+                               options={"num_ctx": num_ctx, "temperature": 0.1}, stream=True):
+            s += r["message"]["content"]
+        return i, f"[Часть {i+1}/{total}]\n{s}"
+
+    summaries = [None] * total
+    with ThreadPoolExecutor(max_workers=min(total, 3)) as pool:
+        futures = {pool.submit(process_chunk, i, chunk): i for i, chunk in enumerate(chunks)}
+        for future in as_completed(futures):
+            i, result = future.result()
+            summaries[i] = result
+            done = sum(1 for s in summaries if s is not None)
+            yield f"data: {json.dumps({'text': f'✅ Часть {i+1} готова ({done}/{total})\\n'})}\n\n"
 
     yield f"data: {json.dumps({'text': '\\n---\\n📝 **Финальный ответ**\\n\\n'})}\n\n"
     yield from stream_text_response("\n\n".join(summaries), question, model, history)
@@ -826,6 +885,9 @@ def api_chat(conv_id):
     # Сохраняем вопрос пользователя
     save_message(conv_id, "user", question, model)
 
+    doc_request = is_document_request(question)
+    doc_fmt     = detect_format(question) if doc_request else "docx"
+
     def generate():
         nonlocal extracted_text
         full_response = []
@@ -862,6 +924,7 @@ def api_chat(conv_id):
                         question,
                         folder_id=folder_id,
                         max_tokens=rag_budget,
+                        include_coverage=is_full_kb_analysis(question),
                     )
                     if rag_chunks:
                         rag_context = build_rag_context(rag_chunks, max_tokens=rag_budget)
@@ -891,10 +954,16 @@ def api_chat(conv_id):
                         messages.append({"role": "user", "content": apply_no_think(question, model)})
                         temp = 0.7
                 else:
-                    messages = [{"role": "system", "content": SYSTEM_PROMPT_CHAT}]
-                    messages += history
-                    messages.append({"role": "user", "content": apply_no_think(question, model)})
-                    temp = 0.7
+                    if doc_request:
+                        messages = [{"role": "system", "content": SYSTEM_PROMPT_DOCGEN}]
+                        messages += history
+                        messages.append({"role": "user", "content": apply_no_think(question, model)})
+                        temp = 0.3
+                    else:
+                        messages = [{"role": "system", "content": SYSTEM_PROMPT_CHAT}]
+                        messages += history
+                        messages.append({"role": "user", "content": apply_no_think(question, model)})
+                        temp = 0.7
 
                 for chunk in _client.chat(model=model, messages=messages,
                                           options={"num_ctx": profile["num_ctx"], "temperature": temp},
@@ -951,19 +1020,30 @@ def api_chat(conv_id):
                                         pass
                                 yield chunk
                         else:
-                            page_texts = []
-                            for i, pil_page in enumerate(pil_pages):
-                                yield f"data: {json.dumps({'text': f'🔍 Страница {i+1}/{len(pil_pages)}...\\n'})}\n\n"
+                            n_pages = len(pil_pages)
+                            yield f"data: {json.dumps({'text': f'🔍 Извлекаю текст из {n_pages} страниц параллельно...\\n\\n'})}\n\n"
+
+                            def extract_page(args):
+                                idx, pil_page = args
                                 b64 = to_base64(pil_page)
                                 r = _client.chat(
                                     model=model,
                                     messages=[{"role": "user",
-                                               "content": apply_no_think(f"Страница {i+1} из {len(pil_pages)}. Извлеки весь текст.", model),
+                                               "content": apply_no_think(f"Страница {idx+1} из {n_pages}. Извлеки весь текст.", model),
                                                "images": [b64]}],
                                     options={"num_ctx": profile["num_ctx"], "temperature": 0.1},
                                     stream=False
                                 )
-                                page_texts.append(f"[Страница {i+1}]\n{r['message']['content']}")
+                                return idx, f"[Страница {idx+1}]\n{r['message']['content']}"
+
+                            page_dict = {}
+                            with ThreadPoolExecutor(max_workers=min(n_pages, 3)) as pool:
+                                futs = {pool.submit(extract_page, (i, p)): i for i, p in enumerate(pil_pages)}
+                                for fut in as_completed(futs):
+                                    idx, text = fut.result()
+                                    page_dict[idx] = text
+                                    yield f"data: {json.dumps({'text': f'✅ Страница {idx+1}/{n_pages} готова\\n'})}\n\n"
+                            page_texts = [page_dict[i] for i in range(n_pages)]
                             extracted_text = "\n\n".join(page_texts)
                             for chunk in stream_map_reduce(page_texts, question, model, history):
                                 if chunk.startswith("data: ") and chunk != "data: [DONE]\n\n":
@@ -1036,6 +1116,40 @@ def api_chat(conv_id):
                              attachment_name=file_name,
                              attachment_text=extracted_text)
 
+                # Генерация документа
+                if doc_request:
+                    code = extract_code(assistant_text)
+
+                    # Если AI не сгенерировал код — принудительный повторный запрос
+                    if not code:
+                        retry_messages = [
+                            {"role": "system", "content": SYSTEM_PROMPT_DOCGEN},
+                            {"role": "user",   "content": question},
+                            {"role": "assistant", "content": assistant_text},
+                            {"role": "user",   "content": (
+                                f"Ты не создал файл. Напиши ТОЛЬКО Python-код "
+                                f"в блоке ```python:document для создания {doc_fmt}-файла "
+                                f"с данными из предыдущего ответа. Никакого текста — только код."
+                            )},
+                        ]
+                        retry_resp = _client.chat(
+                            model=model,
+                            messages=retry_messages,
+                            options={"num_ctx": profile["num_ctx"], "temperature": 0.2},
+                            stream=False,
+                        )
+                        code = extract_code(retry_resp["message"]["content"])
+
+                    if code:
+                        out_path, out_name = make_output_path(doc_fmt)
+                        ok, err = run_code(code, out_path)
+                        if ok:
+                            yield f"data: {json.dumps({'document': {'url': f'/api/download/{out_name}', 'name': out_name, 'fmt': doc_fmt}})}\n\n"
+                        else:
+                            yield f"data: {json.dumps({'text': f'\\n\\n❌ Не удалось создать файл: {err}'})}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'text': '\\n\\n❌ Не удалось сгенерировать код файла. Попробуйте переформулировать запрос.'})}\n\n"
+
                 # Генерируем название чата после первого ответа
                 with get_db() as conn:
                     with conn.cursor() as cur:
@@ -1060,6 +1174,15 @@ def api_chat(conv_id):
                 ).start()
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+
+# ── Скачивание сгенерированных документов ─────────────────────────────────────
+
+@app.route("/api/download/<filename>")
+def api_download(filename):
+    if not re.match(r'^[0-9a-f\-]{36}\.(docx|xlsx|pdf)$', filename):
+        return {"error": "Недопустимое имя файла"}, 400
+    return send_from_directory(DOC_TEMP_DIR, filename, as_attachment=True)
 
 
 # ── База знаний: папки ────────────────────────────────────────────────────────
@@ -1172,6 +1295,7 @@ def api_kb_delete_document(doc_id):
         with conn.cursor() as cur:
             cur.execute("DELETE FROM kb_documents WHERE id=%s", (doc_id,))
         conn.commit()
+    invalidate_kb_caches()
     return {"ok": True}
 
 
@@ -1227,6 +1351,26 @@ def _index_document_async(doc_id: str, tmp_path: str, ext: str, original_name: s
         elif ext in (".csv", ".tsv"):
             text   = read_csv(tmp_path, ext)
             chunks = list(rag_chunk_text(text))
+
+        elif ext in (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"):
+            from PIL import Image, ImageSequence
+            img        = Image.open(tmp_path)
+            frames     = list(ImageSequence.Iterator(img))
+            page_texts = []
+            for i, frame in enumerate(frames):
+                b64 = to_base64(frame.convert("RGB"))
+                r   = _client.chat(
+                    model=MODEL_DEFAULT,
+                    messages=[{"role": "user",
+                               "content": f"Извлеки весь текст со страницы {i+1}. Верни только текст, без пояснений.",
+                               "images": [b64]}],
+                    options={"num_ctx": 4096, "temperature": 0.0},
+                    stream=False,
+                )
+                page_texts.append(r["message"]["content"])
+            if not page_texts:
+                raise ValueError("Не удалось извлечь текст из изображения")
+            chunks = list(rag_chunk_pages(page_texts))
 
         else:
             raise ValueError(f"Неподдерживаемый формат: {ext}")
@@ -1346,7 +1490,752 @@ def api_suggest_model():
     return {"model": model, "reason": reason}
 
 
+# ── Сравнение документов: извлечение форматирования ─────────────────────────
+
+def _to_cm(v):
+    if v is None:
+        return None
+    try:
+        return round(v.cm, 2)
+    except AttributeError:
+        try:
+            return round(float(v) / 914400 * 2.54, 2)
+        except Exception:
+            return None
+
+
+def _to_pt(v):
+    if v is None:
+        return None
+    try:
+        return round(v.pt, 1)
+    except AttributeError:
+        try:
+            return round(float(v) / 12700, 1)
+        except Exception:
+            return None
+
+
+def _build_page_numbers(doc) -> tuple:
+    """
+    Returns (page_list, has_info).
+    page_list[i] = page number (1-based) for doc.paragraphs[i].
+    has_info = True when the document contains reliable page-break markers.
+
+    Detects three kinds of page breaks:
+      1. paragraph_format.page_break_before  (always reliable)
+      2. <w:br w:type="page"/> inside runs   (manual Ctrl+Enter breaks)
+      3. <w:lastRenderedPageBreak/>           (soft breaks saved by Word)
+    """
+    W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    paras = list(doc.paragraphs)
+    n = len(paras)
+    starts_new = [False] * n
+    has_any = False
+
+    # Check once whether the document has lastRenderedPageBreak info
+    has_lrpb = any(
+        run._r.find(f'{{{W}}}lastRenderedPageBreak') is not None
+        for para in paras
+        for run in para.runs
+    )
+
+    for i, para in enumerate(paras):
+        # 1. page_break_before paragraph property
+        try:
+            if para.paragraph_format.page_break_before:
+                starts_new[i] = True
+                has_any = True
+        except Exception:
+            pass
+
+        # 2. lastRenderedPageBreak — only counts when it appears BEFORE
+        #    any real text in the paragraph (meaning the paragraph itself
+        #    is on the new page, not just the tail of the previous one).
+        if has_lrpb and not starts_new[i]:
+            found_text = False
+            done = False
+            for run in para.runs:
+                if done:
+                    break
+                for child in run._r:
+                    tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                    if tag == 'lastRenderedPageBreak':
+                        if not found_text:
+                            starts_new[i] = True
+                            has_any = True
+                        done = True
+                        break
+                    elif tag == 't' and (child.text or '').strip():
+                        found_text = True
+
+        # 3. Explicit manual page break inside THIS paragraph → NEXT para is on new page
+        for run in para.runs:
+            for br in run._r.findall(f'{{{W}}}br'):
+                if br.get(f'{{{W}}}type') == 'page':
+                    if i + 1 < n:
+                        starts_new[i + 1] = True
+                    has_any = True
+
+    page, pages = 1, []
+    for i, starts in enumerate(starts_new):
+        if starts and i > 0:
+            page += 1
+        pages.append(page)
+
+    return pages, (has_lrpb or has_any)
+
+
+def _para_loc(p: dict) -> str:
+    """Human-readable location string for a paragraph dict."""
+    page = p.get('page')       # None when page info is unavailable
+    num  = p.get('para_num', '?')
+    return f"стр. {page}, абз. {num}" if page is not None else f"абз. {num}"
+
+
+def extract_docx_formatting(path: str) -> dict:
+    import docx as python_docx
+    doc = python_docx.Document(path)
+    ALIGN = {0: "слева", 1: "по центру", 2: "справа", 3: "по ширине"}
+
+    margins = {}
+    if doc.sections:
+        s = doc.sections[0]
+        margins = {
+            "top":    _to_cm(s.top_margin),
+            "bottom": _to_cm(s.bottom_margin),
+            "left":   _to_cm(s.left_margin),
+            "right":  _to_cm(s.right_margin),
+        }
+
+    doc_paras = list(doc.paragraphs)
+    page_nums, has_page_info = _build_page_numbers(doc)
+
+    paras = []
+    para_num = 0
+
+    for idx, para in enumerate(doc_paras):
+        text = para.text.strip()
+        if not text:
+            continue
+        para_num += 1
+        pf = para.paragraph_format
+
+        try:
+            ls = pf.line_spacing
+            ls_str = None
+            if ls is not None:
+                try:
+                    ls_str = f"{ls.pt:.1f}pt"
+                except AttributeError:
+                    ls_str = f"{float(ls):.2f}x"
+        except Exception:
+            ls_str = None
+
+        p_info = {
+            "text":          text[:800],
+            "page":          page_nums[idx] if has_page_info else None,
+            "para_num":      para_num,
+            "style":         para.style.name if para.style else None,
+            "align":         ALIGN.get(para.alignment),
+            "indent_left":   _to_cm(pf.left_indent),
+            "indent_first":  _to_cm(pf.first_line_indent),
+            "space_before":  _to_pt(pf.space_before),
+            "space_after":   _to_pt(pf.space_after),
+            "line_spacing":  ls_str,
+            "runs": [],
+        }
+
+        for run in para.runs:
+            rt = run.text.strip()
+            if not rt:
+                continue
+            f = run.font
+            size = _to_pt(f.size)
+            attrs = []
+            if run.bold:      attrs.append("жирный")
+            if run.italic:    attrs.append("курсив")
+            if run.underline: attrs.append("подч.")
+            p_info["runs"].append({
+                "text":    rt[:60],
+                "font":    f.name,
+                "size_pt": size,
+                "attrs":   attrs,
+            })
+
+        paras.append(p_info)
+
+    return {"margins": margins, "paragraphs": paras}
+
+
+def _fmt_docx_for_prompt(name: str, data: dict, max_paras: int = 80) -> str:
+    lines = [f"📄 {name}"]
+
+    m = data.get("margins", {})
+    if any(v is not None for v in m.values()):
+        parts = []
+        for k, lbl in [("top", "верх"), ("bottom", "низ"), ("left", "лево"), ("right", "право")]:
+            if m.get(k) is not None:
+                parts.append(f"{lbl}={m[k]}см")
+        lines.append("Поля: " + ", ".join(parts))
+
+    lines.append("")
+    all_paras = data.get("paragraphs", [])
+    paras = all_paras[:max_paras]
+
+    for i, p in enumerate(paras, 1):
+        # Полный текст абзаца
+        full_text = p["text"].replace("\n", " ")
+        lines.append(f"[{i}] {full_text}")
+
+        # Параметры форматирования — одной строкой
+        fmt = []
+        if p.get("style"):                    fmt.append(f"стиль={p['style']}")
+        if p.get("align"):                    fmt.append(f"выравн={p['align']}")
+        if p.get("indent_left")  is not None: fmt.append(f"отст.лево={p['indent_left']}см")
+        if p.get("indent_first") is not None: fmt.append(f"красн.стр={p['indent_first']}см")
+        if p.get("space_before") is not None: fmt.append(f"до={p['space_before']}pt")
+        if p.get("space_after")  is not None: fmt.append(f"после={p['space_after']}pt")
+        if p.get("line_spacing"):             fmt.append(f"интервал={p['line_spacing']}")
+        if fmt:
+            lines.append("  [" + ", ".join(fmt) + "]")
+
+        # Шрифты — уникальные комбинации
+        seen_fonts = []
+        for r in p.get("runs", []):
+            parts = []
+            if r.get("font"):    parts.append(r["font"])
+            if r.get("size_pt"): parts.append(f"{r['size_pt']}pt")
+            if r.get("attrs"):   parts.extend(r["attrs"])
+            key = " ".join(parts)
+            if key and key not in seen_fonts:
+                seen_fonts.append(key)
+        if seen_fonts:
+            lines.append("  [шрифт: " + "; ".join(seen_fonts[:3]) + "]")
+
+        lines.append("")
+
+    if len(all_paras) > max_paras:
+        lines.append(f"... ещё {len(all_paras) - max_paras} абзацев (не показаны)")
+
+    return "\n".join(lines)
+
+
+def extract_pdf_formatting(path: str) -> dict:
+    """Extract per-block formatting from a text PDF via pymupdf dict mode."""
+    import pymupdf
+    from collections import Counter
+
+    PT_TO_CM = 1 / 28.35
+    doc = pymupdf.open(path)
+    all_paragraphs = []
+    page_margins = {}
+
+    for page_idx, page in enumerate(doc):
+        pw = page.rect.width
+        ph = page.rect.height
+        blocks = page.get_text("dict")["blocks"]
+        text_blocks = [b for b in blocks if b.get("type") == 0]
+
+        if text_blocks and page_idx == 0:
+            xs0 = [b["bbox"][0] for b in text_blocks]
+            xs1 = [b["bbox"][2] for b in text_blocks]
+            ys0 = [b["bbox"][1] for b in text_blocks]
+            ys1 = [b["bbox"][3] for b in text_blocks]
+            page_margins = {
+                "top":    round(min(ys0) * PT_TO_CM, 2),
+                "bottom": round((ph - max(ys1)) * PT_TO_CM, 2),
+                "left":   round(min(xs0) * PT_TO_CM, 2),
+                "right":  round((pw - max(xs1)) * PT_TO_CM, 2),
+            }
+
+        for block in text_blocks:
+            lines = block.get("lines", [])
+            all_spans = [
+                span
+                for line in lines
+                for span in line.get("spans", [])
+                if span.get("text", "").strip()
+            ]
+            block_text = " ".join(s["text"] for s in all_spans).strip()
+            if not block_text:
+                continue
+
+            fonts  = [s["font"] for s in all_spans]
+            sizes  = [round(s["size"], 1) for s in all_spans]
+            flags  = [s.get("flags", 0) for s in all_spans]
+
+            dom_font  = Counter(fonts).most_common(1)[0][0] if fonts else None
+            dom_size  = Counter(sizes).most_common(1)[0][0] if sizes else None
+            is_bold   = any(f & 16 for f in flags)
+            is_italic = any(f & 2  for f in flags)
+
+            # Red-line indent: first line x0 vs average of rest
+            indent_first = None
+            if len(lines) >= 2:
+                first_spans = lines[0].get("spans", [])
+                rest_x0s = [
+                    line["spans"][0]["bbox"][0]
+                    for line in lines[1:]
+                    if line.get("spans")
+                ]
+                if first_spans and rest_x0s:
+                    x0_first = first_spans[0]["bbox"][0]
+                    avg_rest = sum(rest_x0s) / len(rest_x0s)
+                    indent_first = round((x0_first - avg_rest) * PT_TO_CM, 2)
+
+            # Line spacing: avg distance between line tops
+            line_spacing = None
+            if len(lines) >= 2:
+                y_tops = [ln["bbox"][1] for ln in lines]
+                gaps = [y_tops[i + 1] - y_tops[i] for i in range(len(y_tops) - 1)]
+                if gaps:
+                    line_spacing = f"{round(sum(gaps) / len(gaps) * PT_TO_CM, 2)}см"
+
+            attrs = []
+            if is_bold:   attrs.append("жирный")
+            if is_italic: attrs.append("курсив")
+
+            all_paragraphs.append({
+                "text":         block_text[:800],
+                "page":         page_idx + 1,
+                "para_num":     len(all_paragraphs) + 1,
+                "font":         dom_font,
+                "size_pt":      dom_size,
+                "attrs":        attrs,
+                "indent_first": indent_first,
+                "line_spacing": line_spacing,
+            })
+
+    return {"margins": page_margins, "paragraphs": all_paragraphs}
+
+
+def _extract_doc_for_compare(path: str, ext: str, name: str) -> str:
+    try:
+        if ext in (".docx", ".doc"):
+            return _fmt_docx_for_prompt(name, extract_docx_formatting(path))
+        elif ext == ".pdf":
+            pages = read_pdf_text(path) if detect_pdf_type(path) == "text" else []
+            if pages:
+                # Нумеруем страницы, чтобы можно было указать место расхождения
+                numbered = "\n\n".join(f"[Стр. {i+1}]\n{p}" for i, p in enumerate(pages))
+                text = numbered[:16000]
+            else:
+                text = "[Сканированный PDF — текст не извлечён]"
+            return f"📄 {name} [PDF — только текст, форматирование недоступно]\n\n{text}"
+        elif ext in (".txt", ".md", ".log"):
+            raw = read_txt(path)
+            # Разбиваем на абзацы с нумерацией для точного указания места
+            paras = [p.strip() for p in raw.split("\n\n") if p.strip()]
+            numbered = "\n\n".join(f"[{i+1}] {p}" for i, p in enumerate(paras[:120]))
+            return f"📄 {name} [текст]\n\n{numbered}"
+        else:
+            return f"📄 {name} [формат {ext} не поддерживается]"
+    except Exception as e:
+        return f"📄 {name} [ошибка извлечения: {e}]"
+
+
+# ── Сравнение документов: алгоритмический diff ───────────────────────────────
+
+def _word_diff(orig_text: str, copy_text: str) -> list:
+    a, b = orig_text.split(), copy_text.split()
+    if not a and not b:
+        return []
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    changes = []
+    for tag, a1, a2, b1, b2 in sm.get_opcodes():
+        if tag == 'replace':
+            changes.append(f'«{" ".join(a[a1:a2])}» → «{" ".join(b[b1:b2])}»')
+        elif tag == 'delete':
+            changes.append(f'удалено «{" ".join(a[a1:a2])}»')
+        elif tag == 'insert':
+            changes.append(f'добавлено «{" ".join(b[b1:b2])}»')
+    return changes
+
+
+def _dominant_font(runs: list) -> str:
+    counts = {}
+    for r in runs:
+        parts = []
+        if r.get('font'):    parts.append(r['font'])
+        if r.get('size_pt'): parts.append(f"{r['size_pt']}pt")
+        if r.get('attrs'):   parts.extend(r['attrs'])
+        key = " ".join(parts) or '—'
+        counts[key] = counts.get(key, 0) + len(r.get('text', ''))
+    return max(counts, key=counts.get) if counts else '—'
+
+
+def _para_fmt_diff(orig: dict, copy: dict) -> list:
+    result = []
+    loc = _para_loc(orig)
+    for key, lbl in [('style', 'Стиль'), ('align', 'Выравнивание'),
+                     ('indent_left', 'Отступ слева (см)'),
+                     ('indent_first', 'Красная строка (см)'),
+                     ('space_before', 'Интервал до (pt)'),
+                     ('space_after', 'Интервал после (pt)'),
+                     ('line_spacing', 'Межстрочный интервал')]:
+        ov, cv = orig.get(key), copy.get(key)
+        if ov != cv:
+            result.append({
+                'loc': loc,
+                'param': lbl,
+                'orig': str(ov) if ov is not None else '(не задано)',
+                'copy': str(cv) if cv is not None else '(не задано)',
+                'text': orig['text'][:70],
+            })
+    of = _dominant_font(orig.get('runs', []))
+    cf = _dominant_font(copy.get('runs', []))
+    if of != cf:
+        result.append({'loc': loc, 'param': 'Шрифт',
+                       'orig': of, 'copy': cf, 'text': orig['text'][:70]})
+    return result
+
+
+def _compare_docx_data(orig_data: dict, copy_data: dict) -> dict:
+    margin_diffs, text_diffs, fmt_diffs = [], [], []
+
+    om = orig_data.get('margins', {})
+    cm_m = copy_data.get('margins', {})
+    for key, lbl in [('top', 'Верхнее поле'), ('bottom', 'Нижнее поле'),
+                     ('left', 'Левое поле'), ('right', 'Правое поле')]:
+        ov, cv = om.get(key), cm_m.get(key)
+        if ov != cv:
+            margin_diffs.append({
+                'param': lbl,
+                'orig': f'{ov} см' if ov is not None else 'н/д',
+                'copy': f'{cv} см' if cv is not None else 'н/д',
+            })
+
+    op = orig_data.get('paragraphs', [])
+    cp = copy_data.get('paragraphs', [])
+    sm = difflib.SequenceMatcher(None,
+                                  [p['text'] for p in op],
+                                  [p['text'] for p in cp],
+                                  autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal':
+            for oi, ci in zip(range(i1, i2), range(j1, j2)):
+                fmt_diffs.extend(_para_fmt_diff(op[oi], cp[ci]))
+        elif tag == 'replace':
+            if i2 - i1 == 1 and j2 - j1 == 1:
+                changes = _word_diff(op[i1]['text'], cp[j1]['text'])
+                if changes:
+                    text_diffs.append({
+                        'type': 'changed',
+                        'loc': _para_loc(op[i1]),
+                        'changes': changes[:15],
+                        'orig': op[i1]['text'][:150],
+                        'copy': cp[j1]['text'][:150],
+                    })
+                fmt_diffs.extend(_para_fmt_diff(op[i1], cp[j1]))
+            else:
+                for pi in range(i1, i2):
+                    text_diffs.append({'type': 'deleted', 'loc': _para_loc(op[pi]),
+                                       'text': op[pi]['text'][:150]})
+                for pj in range(j1, j2):
+                    text_diffs.append({'type': 'added', 'loc': _para_loc(cp[pj]),
+                                       'text': cp[pj]['text'][:150]})
+        elif tag == 'delete':
+            for pi in range(i1, i2):
+                text_diffs.append({'type': 'deleted', 'loc': _para_loc(op[pi]),
+                                   'text': op[pi]['text'][:150]})
+        elif tag == 'insert':
+            for pj in range(j1, j2):
+                text_diffs.append({'type': 'added', 'loc': _para_loc(cp[pj]),
+                                   'text': cp[pj]['text'][:150]})
+
+    return {'margin_diffs': margin_diffs, 'text_diffs': text_diffs, 'fmt_diffs': fmt_diffs}
+
+
+def _compare_pdf_data(orig_data: dict, copy_data: dict) -> dict:
+    """Full diff for two text PDFs: margins + text + per-block formatting."""
+    margin_diffs, text_diffs, fmt_diffs = [], [], []
+
+    om   = orig_data.get("margins", {})
+    cm_m = copy_data.get("margins", {})
+    for key, lbl in [("top", "Верхнее поле"), ("bottom", "Нижнее поле"),
+                     ("left", "Левое поле"), ("right", "Правое поле")]:
+        ov, cv = om.get(key), cm_m.get(key)
+        if ov != cv:
+            margin_diffs.append({
+                "param": lbl,
+                "orig":  f"{ov} см" if ov is not None else "н/д",
+                "copy":  f"{cv} см" if cv is not None else "н/д",
+            })
+
+    op = orig_data.get("paragraphs", [])
+    cp = copy_data.get("paragraphs", [])
+    sm = difflib.SequenceMatcher(None,
+                                  [p["text"] for p in op],
+                                  [p["text"] for p in cp],
+                                  autojunk=False)
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for oi, ci in zip(range(i1, i2), range(j1, j2)):
+                loc = _para_loc(op[oi])
+                for key, lbl in [("font", "Шрифт"), ("size_pt", "Размер (pt)"),
+                                  ("indent_first", "Красная строка (см)"),
+                                  ("line_spacing", "Межстрочный интервал")]:
+                    ov = op[oi].get(key)
+                    cv = cp[ci].get(key)
+                    if ov != cv:
+                        fmt_diffs.append({
+                            "loc":   loc,
+                            "param": lbl,
+                            "orig":  str(ov) if ov is not None else "(не задано)",
+                            "copy":  str(cv) if cv is not None else "(не задано)",
+                            "text":  op[oi]["text"][:70],
+                        })
+                # attrs is a list — compare as sorted tuple
+                oa = ", ".join(sorted(op[oi].get("attrs", []))) or "обычный"
+                ca = ", ".join(sorted(cp[ci].get("attrs", []))) or "обычный"
+                if oa != ca:
+                    fmt_diffs.append({
+                        "loc": loc, "param": "Начертание",
+                        "orig": oa, "copy": ca, "text": op[oi]["text"][:70],
+                    })
+        elif tag == "replace":
+            if i2 - i1 == 1 and j2 - j1 == 1:
+                changes = _word_diff(op[i1]["text"], cp[j1]["text"])
+                if changes:
+                    text_diffs.append({
+                        "type": "changed", "loc": _para_loc(op[i1]),
+                        "changes": changes[:15],
+                        "orig": op[i1]["text"][:150], "copy": cp[j1]["text"][:150],
+                    })
+            else:
+                for pi in range(i1, i2):
+                    text_diffs.append({"type": "deleted", "loc": _para_loc(op[pi]),
+                                       "text": op[pi]["text"][:150]})
+                for pj in range(j1, j2):
+                    text_diffs.append({"type": "added", "loc": _para_loc(cp[pj]),
+                                       "text": cp[pj]["text"][:150]})
+        elif tag == "delete":
+            for pi in range(i1, i2):
+                text_diffs.append({"type": "deleted", "loc": _para_loc(op[pi]),
+                                   "text": op[pi]["text"][:150]})
+        elif tag == "insert":
+            for pj in range(j1, j2):
+                text_diffs.append({"type": "added", "loc": _para_loc(cp[pj]),
+                                   "text": cp[pj]["text"][:150]})
+
+    return {"margin_diffs": margin_diffs, "text_diffs": text_diffs, "fmt_diffs": fmt_diffs}
+
+
+def _compare_text_data(orig_text: str, copy_text: str) -> dict:
+    def split_paras(text):
+        """Split into dicts with text/page/para_num; honours [Страница N] markers from PDF."""
+        current_page = 1
+        para_num = 0
+        result = []
+        for chunk in re.split(r'\n{2,}', text):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            m = re.match(r'^\[Страница (\d+)\]\n?(.*)', chunk, re.DOTALL)
+            if m:
+                current_page = int(m.group(1))
+                body = m.group(2).strip()
+                if body:
+                    para_num += 1
+                    result.append({'text': body, 'page': current_page, 'para_num': para_num})
+            else:
+                para_num += 1
+                result.append({'text': chunk, 'page': current_page, 'para_num': para_num})
+        return result
+
+    op = split_paras(orig_text)
+    cp = split_paras(copy_text)
+    text_diffs = []
+    sm = difflib.SequenceMatcher(None,
+                                  [p['text'] for p in op],
+                                  [p['text'] for p in cp],
+                                  autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'replace':
+            if i2 - i1 == 1 and j2 - j1 == 1:
+                changes = _word_diff(op[i1]['text'], cp[j1]['text'])
+                if changes:
+                    text_diffs.append({
+                        'type': 'changed', 'loc': _para_loc(op[i1]),
+                        'changes': changes[:15],
+                        'orig': op[i1]['text'][:150], 'copy': cp[j1]['text'][:150],
+                    })
+            else:
+                for pi in range(i1, i2):
+                    text_diffs.append({'type': 'deleted', 'loc': _para_loc(op[pi]),
+                                       'text': op[pi]['text'][:150]})
+                for pj in range(j1, j2):
+                    text_diffs.append({'type': 'added', 'loc': _para_loc(cp[pj]),
+                                       'text': cp[pj]['text'][:150]})
+        elif tag == 'delete':
+            for pi in range(i1, i2):
+                text_diffs.append({'type': 'deleted', 'loc': _para_loc(op[pi]),
+                                   'text': op[pi]['text'][:150]})
+        elif tag == 'insert':
+            for pj in range(j1, j2):
+                text_diffs.append({'type': 'added', 'loc': _para_loc(cp[pj]),
+                                   'text': cp[pj]['text'][:150]})
+    return {'margin_diffs': [], 'text_diffs': text_diffs, 'fmt_diffs': []}
+
+
+def _render_diff_report(copy_name: str, diff: dict) -> str:
+    md_d = diff['margin_diffs']
+    td   = diff['text_diffs']
+    fd   = diff['fmt_diffs']
+    total = len(md_d) + len(td) + len(fd)
+
+    lines = [f"## Копия — «{copy_name}»", ""]
+    if total == 0:
+        lines.append("✅ **Документ полностью соответствует оригиналу — расхождений не обнаружено.**")
+        return '\n'.join(lines)
+
+    lines.append(
+        f"Обнаружено расхождений: **{total}** "
+        f"(текстовых: **{len(td)}**, "
+        f"форматирование: **{len(md_d) + len(fd)}**)"
+    )
+    lines.append("")
+
+    if md_d:
+        lines += ["### 📐 Поля страницы", ""]
+        for d in md_d:
+            lines.append(f"- **{d['param']}:** `{d['orig']}` → `{d['copy']}`")
+        lines.append("")
+
+    if td:
+        lines += ["### ✏️ Текстовые расхождения", ""]
+        for d in td:
+            loc = d.get('loc', '?')
+            if d['type'] == 'deleted':
+                lines.append(f"- ❌ **Удалён** ({loc}): «{d['text']}»")
+            elif d['type'] == 'added':
+                lines.append(f"- ➕ **Добавлен** ({loc}): «{d['text']}»")
+            elif d['type'] == 'changed':
+                lines.append(f"- 🔄 **Изменён** ({loc}):")
+                lines.append(f"  - Оригинал: «{d['orig']}»")
+                lines.append(f"  - Копия:    «{d['copy']}»")
+                lines.append(f"  - Изменения:")
+                for ch in d['changes']:
+                    lines.append(f"    - {ch}")
+        lines.append("")
+
+    if fd:
+        lines += ["### 🎨 Форматирование абзацев", ""]
+        for d in fd:
+            lines.append(
+                f"- **{d['param']}** ({d.get('loc', '?')}, «{d['text']}…»): "
+                f"`{d['orig']}` → `{d['copy']}`"
+            )
+        lines.append("")
+
+    return '\n'.join(lines)
+
+
+@app.route("/api/compare", methods=["POST"])
+def api_compare_documents():
+    model   = request.form.get("model", MODEL_DEFAULT)
+    orig_f  = request.files.get("original")
+    copy_fs = request.files.getlist("copies")
+
+    if not orig_f or not orig_f.filename:
+        return jsonify({"error": "Оригинальный документ не передан"}), 400
+    if not copy_fs:
+        return jsonify({"error": "Не переданы копии для сравнения"}), 400
+
+    def _save(f):
+        ext = os.path.splitext(f.filename)[1].lower()
+        tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+        p = tmp.name
+        tmp.close()
+        f.save(p)
+        return p, ext
+
+    orig_path, orig_ext = _save(orig_f)
+    copies_saved = [_save(f) for f in copy_fs]
+    copy_names = [f.filename for f in copy_fs]
+
+    def generate():
+        try:
+            # Pre-extract original data once
+            profile = get_profile(model)
+            if orig_ext in ('.docx', '.doc'):
+                orig_docx_data = extract_docx_formatting(orig_path)
+                orig_pdf_data  = None
+                orig_plain_text = "\n\n".join(
+                    p['text'] for p in orig_docx_data.get('paragraphs', [])
+                )
+            elif orig_ext == '.pdf':
+                orig_docx_data = None
+                if detect_pdf_type(orig_path) == "text":
+                    orig_pdf_data   = extract_pdf_formatting(orig_path)
+                    orig_plain_text = "\n\n".join(
+                        p['text'] for p in orig_pdf_data.get('paragraphs', [])
+                    )
+                else:
+                    orig_pdf_data = None
+                    yield f"data: {json.dumps({'text': '🖼️ Оригинал — скан, распознаю текст...\\n\\n'})}\n\n"
+                    orig_plain_text = read_scanned_pdf_as_text(orig_path, model, profile)
+            else:
+                orig_plain_text = read_txt(orig_path)
+                orig_docx_data  = None
+                orig_pdf_data   = None
+
+            for i, (copy_path, copy_ext) in enumerate(copies_saved):
+                copy_name = copy_names[i]
+                if i > 0:
+                    yield f"data: {json.dumps({'text': chr(10) + '---' + chr(10) + chr(10)})}\n\n"
+
+                try:
+                    if orig_docx_data is not None and copy_ext in ('.docx', '.doc'):
+                        copy_docx_data = extract_docx_formatting(copy_path)
+                        diff = _compare_docx_data(orig_docx_data, copy_docx_data)
+                    elif orig_pdf_data is not None and copy_ext == '.pdf':
+                        if detect_pdf_type(copy_path) == "text":
+                            copy_pdf_data = extract_pdf_formatting(copy_path)
+                            diff = _compare_pdf_data(orig_pdf_data, copy_pdf_data)
+                        else:
+                            yield f"data: {json.dumps({'text': f'🖼️ Копия — скан, распознаю текст...\\n\\n'})}\n\n"
+                            copy_plain = read_scanned_pdf_as_text(copy_path, model, profile)
+                            diff = _compare_text_data(orig_plain_text, copy_plain)
+                    else:
+                        if copy_ext in ('.docx', '.doc'):
+                            copy_plain = read_docx(copy_path)
+                        elif copy_ext == '.pdf':
+                            if detect_pdf_type(copy_path) == "text":
+                                pages = read_pdf_text(copy_path)
+                                copy_plain = "\n\n".join(pages)
+                            else:
+                                yield f"data: {json.dumps({'text': f'🖼️ Копия — скан, распознаю текст...\\n\\n'})}\n\n"
+                                copy_plain = read_scanned_pdf_as_text(copy_path, model, profile)
+                        else:
+                            copy_plain = read_txt(copy_path)
+                        diff = _compare_text_data(orig_plain_text, copy_plain)
+
+                    report = _render_diff_report(copy_name, diff)
+                    for line in report.split('\n'):
+                        yield f"data: {json.dumps({'text': line + chr(10)})}\n\n"
+
+                except Exception as e:
+                    yield f"data: {json.dumps({'text': chr(10) + '⚠️ Ошибка при сравнении «' + copy_name + '»: ' + str(e) + chr(10)})}\n\n"
+
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield "data: [DONE]\n\n"
+        finally:
+            for p in [orig_path] + [p for p, _ in copies_saved]:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+
 if __name__ == "__main__":
-    init_db()
+    # init_db()
     print("🚀 Запуск на http://localhost:5000")
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)

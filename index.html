@@ -44,6 +44,7 @@
       <div class="nav-tabs">
         <button class="nav-tab active" id="tab-btn-chats" onclick="switchTab('chats')">Чаты</button>
         <button class="nav-tab" id="tab-btn-kb" onclick="switchTab('kb')">База знаний</button>
+        <button class="nav-tab" id="tab-btn-compare" onclick="switchTab('compare')">Сравнение</button>
       </div>
 
       <!-- Панель чатов -->
@@ -83,12 +84,56 @@
             Загрузить документ
           </button>
           <input type="file" id="kb-file-input" style="display:none"
-            accept=".pdf,.docx,.doc,.xlsx,.xls,.xlsm,.txt,.md,.csv,.tsv"
+            accept=".pdf,.docx,.doc,.xlsx,.xls,.xlsm,.txt,.md,.csv,.tsv,.jpg,.jpeg,.png,.bmp,.webp,.tiff,.tif"
             onchange="onKbFileSelected(event)">
         </div>
         <div class="kb-docs-list" id="kb-docs-list">
           <div class="chats-empty">Нет документов</div>
         </div>
+      </div>
+
+      <!-- Панель сравнения документов -->
+      <div id="panel-compare" class="tab-panel" style="display:none">
+
+        <div class="cmp-section">
+          <div class="cmp-label">Оригинал (эталон)</div>
+          <div class="cmp-orig-zone" id="cmp-orig-zone"
+               onclick="document.getElementById('cmp-orig-input').click()">
+            <div class="cmp-zone-inner" id="cmp-orig-inner">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+                   stroke-linecap="round" stroke-linejoin="round" style="width:18px;height:18px;flex-shrink:0">
+                <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+                <line x1="12" y1="18" x2="12" y2="12"/>
+                <line x1="9" y1="15" x2="15" y2="15"/>
+              </svg>
+              <span>Загрузить оригинал</span>
+            </div>
+          </div>
+          <input type="file" id="cmp-orig-input" style="display:none"
+            accept=".pdf,.docx,.doc,.txt,.md"
+            onchange="onCmpOrigSelected(event)">
+        </div>
+
+        <div class="cmp-section">
+          <div class="cmp-label">Копии для проверки</div>
+          <div class="cmp-copies-list" id="cmp-copies-list"></div>
+          <button class="cmp-add-btn" onclick="document.getElementById('cmp-copy-input').click()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
+                 stroke-linecap="round" style="width:12px;height:12px;flex-shrink:0">
+              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+            Добавить копию
+          </button>
+          <input type="file" id="cmp-copy-input" style="display:none"
+            accept=".pdf,.docx,.doc,.txt,.md" multiple
+            onchange="onCmpCopySelected(event)">
+        </div>
+
+        <button class="cmp-run-btn" id="cmp-run-btn" onclick="startComparison()" disabled>
+          Сравнить документы
+        </button>
+
       </div>
     </div>
 

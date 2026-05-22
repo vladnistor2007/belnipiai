@@ -1,8 +1,13 @@
 import os
 import re
+import threading
+from collections import OrderedDict
+from collections import defaultdict
+from contextlib import contextmanager
 from typing import Optional
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 import ollama
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -15,18 +20,105 @@ API_TOP_K       = 30
 CONTEXT_POOL_K  = 160
 CONTEXT_WINDOW  = 1
 TABLE_DOC_TYPES = {"xlsx", "xls", "xlsm", "ods", "csv", "tsv"}
+EMBED_BATCH_SIZE = 64
+SEARCH_CANDIDATE_MULTIPLIER = 8
+HNSW_EF_SEARCH = 96
+MAX_PHRASE_KEYWORD_CHARS = 120
+MAX_PHRASE_KEYWORD_WORDS = 12
+QUERY_EMBED_CACHE_SIZE = 256
+SEARCH_CACHE_SIZE = 128
+CONTEXT_CACHE_SIZE = 64
 
 _embed_client = ollama.Client(host=OLLAMA_HOST)
 
+_pool: "psycopg2.pool.ThreadedConnectionPool | None" = None
+_pool_lock = threading.Lock()
+_cache_lock = threading.Lock()
+_kb_revision = 0
+_query_embed_cache: "OrderedDict[str, list[float]]" = OrderedDict()
+_search_cache: "OrderedDict[tuple, list[dict]]" = OrderedDict()
+_context_cache: "OrderedDict[tuple, list[dict]]" = OrderedDict()
 
+
+def _get_pool() -> "psycopg2.pool.ThreadedConnectionPool":
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                _pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=2,
+                    maxconn=10,
+                    dsn=DATABASE_URL,
+                    cursor_factory=psycopg2.extras.RealDictCursor,
+                )
+    return _pool
+
+
+@contextmanager
 def get_db():
-    return psycopg2.connect(DATABASE_URL,
-                            cursor_factory=psycopg2.extras.RealDictCursor)
+    pool = _get_pool()
+    conn = pool.getconn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pool.putconn(conn)
 
 
 def get_embedding(text: str) -> list[float]:
     resp = _embed_client.embeddings(model=EMBED_MODEL, prompt=text)
     return resp["embedding"]
+
+
+def _cache_get(cache: "OrderedDict", key):
+    with _cache_lock:
+        value = cache.get(key)
+        if value is None:
+            return None
+        cache.move_to_end(key)
+        return value
+
+
+def _cache_put(cache: "OrderedDict", key, value, max_size: int) -> None:
+    with _cache_lock:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > max_size:
+            cache.popitem(last=False)
+
+
+def _invalidate_search_caches() -> None:
+    global _kb_revision
+    with _cache_lock:
+        _kb_revision += 1
+        _search_cache.clear()
+        _context_cache.clear()
+
+
+def invalidate_kb_caches() -> None:
+    _invalidate_search_caches()
+
+
+def _get_query_embedding(text: str) -> list[float]:
+    cached = _cache_get(_query_embed_cache, text)
+    if cached is not None:
+        return list(cached)
+    embedding = get_embedding(text)
+    _cache_put(_query_embed_cache, text, list(embedding), QUERY_EMBED_CACHE_SIZE)
+    return embedding
+
+
+def _get_embeddings_batch(texts: list[str]) -> list[list[float]]:
+    """Batch embedding: N texts → 1 HTTP call per EMBED_BATCH_SIZE texts."""
+    result: list[list[float]] = []
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[i : i + EMBED_BATCH_SIZE]
+        resp = _embed_client.embed(model=EMBED_MODEL, input=batch)
+        result.extend(resp["embeddings"])
+    return result
 
 
 def estimate_tokens(text: str) -> int:
@@ -35,6 +127,8 @@ def estimate_tokens(text: str) -> int:
 
 
 def index_document(document_id: str, chunks: list[dict]) -> None:
+    if not chunks:
+        return
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -43,24 +137,30 @@ def index_document(document_id: str, chunks: list[dict]) -> None:
             )
             conn.commit()
 
-            for chunk in chunks:
-                embedding = get_embedding(chunk["content"])
-                cur.execute("""
-                    INSERT INTO doc_chunks
-                      (document_id, chunk_index, content, content_tsv,
-                       embedding, page_num, token_count)
-                    VALUES (%s, %s, %s,
-                      to_tsvector('russian', %s),
-                      %s::vector, %s, %s)
-                """, (
-                    document_id,
-                    chunk["chunk_index"],
-                    chunk["content"],
-                    chunk["content"],
-                    str(embedding),
-                    chunk.get("page_num"),
-                    chunk.get("token_count", 0),
-                ))
+            embeddings = _get_embeddings_batch([c["content"] for c in chunks])
+
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO doc_chunks
+                  (document_id, chunk_index, content, content_tsv,
+                   embedding, page_num, token_count)
+                VALUES %s
+                """,
+                [
+                    (
+                        document_id,
+                        chunk["chunk_index"],
+                        chunk["content"],
+                        chunk["content"],
+                        str(emb),
+                        chunk.get("page_num"),
+                        chunk.get("token_count", 0),
+                    )
+                    for chunk, emb in zip(chunks, embeddings)
+                ],
+                template="(%s, %s, %s, to_tsvector('russian', %s), %s::vector, %s, %s)",
+            )
 
             cur.execute(
                 "UPDATE kb_documents "
@@ -69,6 +169,7 @@ def index_document(document_id: str, chunks: list[dict]) -> None:
                 (len(chunks), document_id)
             )
         conn.commit()
+    _invalidate_search_caches()
 
 
 def _keyword_terms(query: str, limit: int = 8) -> list[str]:
@@ -84,16 +185,35 @@ def _keyword_terms(query: str, limit: int = 8) -> list[str]:
     return terms
 
 
+def _use_phrase_keyword(query: str) -> bool:
+    if not query:
+        return False
+    if len(query) > MAX_PHRASE_KEYWORD_CHARS:
+        return False
+    if len(query.split()) > MAX_PHRASE_KEYWORD_WORDS:
+        return False
+    return True
+
+
 def hybrid_search(query: str, top_k: int = TOP_K,
                   folder_id: Optional[str] = None) -> list[dict]:
-    query_vec = get_embedding(query)
+    cache_key = (_kb_revision, folder_id or "", query, top_k)
+    cached = _cache_get(_search_cache, cache_key)
+    if cached is not None:
+        return [dict(row) for row in cached]
+
+    query_vec = _get_query_embedding(query)
     vec_str   = str(query_vec)
     terms     = _keyword_terms(query)
+    use_phrase_keyword = _use_phrase_keyword(query)
 
     folder_clause = "AND d.folder_id = %(folder_id)s" if folder_id else ""
     keyword_where = ""
-    keyword_score_parts = ["CASE WHEN c.content ILIKE %(phrase)s THEN 1.0 ELSE 0 END"]
-    keyword_params = {"phrase": f"%{query}%"}
+    keyword_score_parts = []
+    keyword_params = {}
+    if use_phrase_keyword:
+        keyword_score_parts.append("CASE WHEN c.content ILIKE %(phrase)s THEN 1.0 ELSE 0 END")
+        keyword_params["phrase"] = f"%{query}%"
     if terms:
         term_clauses = []
         for i, term in enumerate(terms):
@@ -101,9 +221,15 @@ def hybrid_search(query: str, top_k: int = TOP_K,
             keyword_params[key] = f"%{term}%"
             term_clauses.append(f"c.content ILIKE %({key})s")
             keyword_score_parts.append(f"CASE WHEN c.content ILIKE %({key})s THEN 1.0 ELSE 0 END")
-        keyword_where = "AND (" + " OR ".join(term_clauses + ["c.content ILIKE %(phrase)s"]) + ")"
-    else:
+        keyword_matchers = list(term_clauses)
+        if use_phrase_keyword:
+            keyword_matchers.append("c.content ILIKE %(phrase)s")
+        keyword_where = "AND (" + " OR ".join(keyword_matchers) + ")"
+    elif use_phrase_keyword:
         keyword_where = "AND c.content ILIKE %(phrase)s"
+    else:
+        keyword_where = ""
+        keyword_score_parts.append("0.0")
     keyword_score_expr = " + ".join(keyword_score_parts)
     keyword_norm = max(1, len(keyword_score_parts))
 
@@ -183,7 +309,7 @@ def hybrid_search(query: str, top_k: int = TOP_K,
         "vec":    vec_str,
         "query":  query,
         "top_k":  top_k,
-        "lim":    max(top_k * 12, CONTEXT_POOL_K),
+        "lim":    max(top_k * SEARCH_CANDIDATE_MULTIPLIER, CONTEXT_POOL_K),
         "keyword_norm": keyword_norm,
         "folder_id": folder_id,
     }
@@ -191,9 +317,11 @@ def hybrid_search(query: str, top_k: int = TOP_K,
 
     with get_db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SET LOCAL hnsw.ef_search = 120")
+            cur.execute("SET LOCAL hnsw.ef_search = %s", (HNSW_EF_SEARCH,))
             cur.execute(sql, params)
-            return [dict(r) for r in cur.fetchall()]
+            rows = [dict(r) for r in cur.fetchall()]
+    _cache_put(_search_cache, cache_key, [dict(row) for row in rows], SEARCH_CACHE_SIZE)
+    return rows
 
 
 def expand_with_neighbors(chunks: list[dict]) -> list[dict]:
@@ -211,43 +339,61 @@ def expand_with_neighbors(chunks: list[dict]) -> list[dict]:
             [lo, hi, float(c.get("score", 0)), c]
         )
 
-    results: list[dict] = []
+    # Merge overlapping ranges per document (same logic as before)
+    all_merged: list[tuple] = []  # (doc_id, lo, hi, score, base)
+    for doc_id, ranges in doc_ranges.items():
+        ranges.sort(key=lambda x: x[0])
+        merged: list[list] = []
+        for lo, hi, score, base in ranges:
+            if merged and lo <= merged[-1][1] + 1:
+                prev = merged[-1]
+                prev[1] = max(prev[1], hi)
+                if score > prev[2]:
+                    prev[2] = score
+                    prev[3] = base
+            else:
+                merged.append([lo, hi, score, base])
+        for lo, hi, score, base in merged:
+            all_merged.append((doc_id, lo, hi, score, base))
+
+    if not all_merged:
+        return []
+
+    # One batch query for all ranges instead of N separate queries
+    conditions: list[str] = []
+    params: list = []
+    for doc_id, lo, hi, _, _ in all_merged:
+        conditions.append(
+            "(document_id = %s AND chunk_index BETWEEN %s AND %s)"
+        )
+        params.extend([doc_id, lo, hi])
+
+    sql = (
+        "SELECT content, chunk_index, page_num, document_id FROM doc_chunks"
+        " WHERE " + " OR ".join(conditions) +
+        " ORDER BY document_id, chunk_index"
+    )
+
     with get_db() as conn:
         with conn.cursor() as cur:
-            for doc_id, ranges in doc_ranges.items():
-                ranges.sort(key=lambda x: x[0])
+            cur.execute(sql, params)
+            all_rows = [dict(r) for r in cur.fetchall()]
 
-                merged: list[list] = []
-                for lo, hi, score, base in ranges:
-                    if merged and lo <= merged[-1][1] + 1:
-                        prev = merged[-1]
-                        prev[1] = max(prev[1], hi)
-                        if score > prev[2]:
-                            prev[2] = score
-                            prev[3] = base
-                    else:
-                        merged.append([lo, hi, score, base])
+    # Group fetched rows by document_id for O(1) lookup
+    doc_rows: dict[str, list[dict]] = defaultdict(list)
+    for row in all_rows:
+        doc_rows[row["document_id"]].append(row)
 
-                for lo, hi, score, base in merged:
-                    cur.execute(
-                        """
-                        SELECT content, chunk_index, page_num
-                        FROM doc_chunks
-                        WHERE document_id = %s
-                          AND chunk_index BETWEEN %s AND %s
-                        ORDER BY chunk_index
-                        """,
-                        (doc_id, lo, hi),
-                    )
-                    rows = [dict(r) for r in cur.fetchall()]
-                    if not rows:
-                        continue
-
-                    passage = base.copy()
-                    passage["content"] = "\n\n".join(r["content"] for r in rows)
-                    passage["score"] = score
-                    passage["page_num"] = rows[0]["page_num"]
-                    results.append(passage)
+    results: list[dict] = []
+    for doc_id, lo, hi, score, base in all_merged:
+        rows = [r for r in doc_rows[doc_id] if lo <= r["chunk_index"] <= hi]
+        if not rows:
+            continue
+        passage = base.copy()
+        passage["content"] = "\n\n".join(r["content"] for r in rows)
+        passage["score"] = score
+        passage["page_num"] = rows[0]["page_num"]
+        results.append(passage)
 
     results.sort(key=lambda x: x.get("score", 0), reverse=True)
     return results
@@ -364,16 +510,24 @@ def pack_chunks_for_context(chunks: list[dict], max_tokens: int) -> list[dict]:
 
 
 def build_context_chunks(query: str, folder_id: Optional[str] = None,
-                         max_tokens: int = 24000) -> list[dict]:
+                         max_tokens: int = 24000,
+                         include_coverage: bool = False) -> list[dict]:
+    cache_key = (_kb_revision, folder_id or "", query, max_tokens, include_coverage)
+    cached = _cache_get(_context_cache, cache_key)
+    if cached is not None:
+        return [dict(row) for row in cached]
+
     relevant = expand_with_neighbors(
         hybrid_search(query, top_k=TOP_K, folder_id=folder_id)
     )
-    coverage = fetch_document_coverage(folder_id=folder_id)
 
     combined: list[dict] = []
     combined.extend(relevant)
-    combined.extend(coverage)
-    return pack_chunks_for_context(combined, max_tokens=max_tokens)
+    if include_coverage:
+        combined.extend(fetch_document_coverage(folder_id=folder_id))
+    packed = pack_chunks_for_context(combined, max_tokens=max_tokens)
+    _cache_put(_context_cache, cache_key, [dict(row) for row in packed], CONTEXT_CACHE_SIZE)
+    return packed
 
 
 def build_rag_context(chunks: list[dict], max_tokens: Optional[int] = None) -> str:

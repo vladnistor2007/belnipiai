@@ -283,15 +283,20 @@ async function loadModels() {
   try {
     const d = await fetch('/api/models').then(r => r.json());
     const models = d.models && d.models.length ? d.models : [{id: 'gemma3:4b', label: 'Базовая'}];
+    const visibleModels = models.filter(m => {
+      const id = typeof m === 'string' ? m : m.id;
+      return id !== 'nomic-embed-text:latest';
+    });
+    const fallbackModels = visibleModels.length ? visibleModels : [{id: 'gemma3:4b', label: 'Базовая'}];
     _modelMap = {};
-    models.forEach(m => {
+    fallbackModels.forEach(m => {
       const id = typeof m === 'string' ? m : m.id;
       const label = typeof m === 'string' ? m : m.label;
       _modelMap[id] = label;
     });
-    renderModelDrop(models);
-    if (models.length) {
-      const first = typeof models[0] === 'string' ? models[0] : models[0].id;
+    renderModelDrop(fallbackModels);
+    if (fallbackModels.length) {
+      const first = typeof fallbackModels[0] === 'string' ? fallbackModels[0] : fallbackModels[0].id;
       selectModel(first);
     }
   } catch {
@@ -525,7 +530,7 @@ async function sendMessage() {
       const {done, value} = await reader.read(); if (done) break;
       for (const line of dec.decode(value).split('\n')) {
         if (!line.startsWith('data: ')) continue;
-        const p = line.slice(6); if (p === '[DONE]') break;
+        const p = line.slice(6); if (p === '[DONE]') continue;
         try {
           const o = JSON.parse(p);
           if (o.error) { showToast(o.error, true); break; }
@@ -540,8 +545,13 @@ async function sendMessage() {
           if (o.text) {
             if (first) { dots.remove(); first = false; }
             raw += o.text;
-            ac.innerHTML = parseMd(raw) + '<span class="cursor"></span>';
+            ac.innerHTML = parseMd(hideDocCode(raw)) + '<span class="cursor"></span>';
             addCodeBtns(ac); scrollEnd();
+          }
+          if (o.document) {
+            if (first) { dots.remove(); first = false; }
+            ac.parentElement.appendChild(buildDocDownload(o.document));
+            scrollEnd();
           }
         } catch(e) {}
       }
@@ -557,7 +567,7 @@ async function sendMessage() {
   const cur = ac.querySelector('.cursor'); if (cur) cur.remove();
   if (first) dots.remove();
   if (raw) {
-    ac.innerHTML = parseMd(raw);
+    ac.innerHTML = parseMd(hideDocCode(raw));
     addCodeBtns(ac);
     addMsgCopy(ac, ac.innerHTML);
   }
@@ -705,6 +715,26 @@ function toggleRag() {
 
 // ── Источники RAG ─────────────────────────────────────────────────────────────
 
+function hideDocCode(text) {
+  // Remove complete python:document blocks
+  let s = text.replace(/```python:document[\s\S]*?```/g, '');
+  // Hide incomplete block still being streamed
+  s = s.replace(/```python:document[\s\S]*/g, '');
+  return s.trim();
+}
+
+function buildDocDownload(doc) {
+  const fmt = doc.fmt || (doc.name || '').split('.').pop();
+  const icons  = { docx: '📄', xlsx: '📊', pdf: '📋' };
+  const labels = { docx: 'Word документ', xlsx: 'Excel таблицу', pdf: 'PDF файл' };
+  const icon  = icons[fmt]  || '📁';
+  const label = labels[fmt] || fmt.toUpperCase();
+  const div = document.createElement('div');
+  div.className = 'doc-dl-wrap';
+  div.innerHTML = `<a href="${doc.url}" download="${doc.name}" class="doc-dl-btn">${icon} Скачать ${label}</a>`;
+  return div;
+}
+
 function buildSourcesBlock(sources) {
   const wrap = document.createElement('div');
   wrap.className = 'rag-sources';
@@ -754,10 +784,29 @@ function buildSourcesBlock(sources) {
 // ── Вкладки nav ───────────────────────────────────────────────────────────────
 
 function switchTab(name) {
-  document.getElementById('panel-chats').style.display = name === 'chats' ? 'flex' : 'none';
-  document.getElementById('panel-kb').style.display    = name === 'kb'    ? 'flex' : 'none';
-  document.getElementById('tab-btn-chats').classList.toggle('active', name === 'chats');
-  document.getElementById('tab-btn-kb').classList.toggle('active',    name === 'kb');
+  document.getElementById('panel-chats').style.display   = name === 'chats'   ? 'flex' : 'none';
+  document.getElementById('panel-kb').style.display      = name === 'kb'      ? 'flex' : 'none';
+  document.getElementById('panel-compare').style.display = name === 'compare' ? 'flex' : 'none';
+  document.getElementById('tab-btn-chats').classList.toggle('active',   name === 'chats');
+  document.getElementById('tab-btn-kb').classList.toggle('active',      name === 'kb');
+  document.getElementById('tab-btn-compare').classList.toggle('active', name === 'compare');
+
+  const bar = document.querySelector('.bar');
+  if (bar) bar.style.display = name === 'compare' ? 'none' : '';
+
+  const emptyEl = document.getElementById('empty-state');
+  if (emptyEl) {
+    if (name === 'compare') {
+      emptyEl.querySelector('.welcome-title').textContent = 'Сравнение документов';
+      emptyEl.querySelector('.welcome-sub').textContent =
+        'Загрузите оригинал и одну или несколько копий в панели слева, затем нажмите «Сравнить»';
+    } else {
+      emptyEl.querySelector('.welcome-title').textContent = 'Добрый день';
+      emptyEl.querySelector('.welcome-sub').textContent =
+        'Загрузите документ или задайте вопрос — анализирую PDF, DOCX, Excel, изображения и другие форматы';
+    }
+  }
+
   if (name === 'kb') loadKbFolders();
 }
 
@@ -925,6 +974,188 @@ async function deleteKbDoc(docId) {
   } catch(e) {
     showToast('Ошибка удаления', true);
   }
+}
+
+// ── Сравнение документов ─────────────────────────────────────────────────────
+
+let cmpOriginal = null;
+let cmpCopies   = [];
+
+function _cmpDocIcon(name) {
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  return {pdf:'📄',docx:'📝',doc:'📝',txt:'📃',md:'📃'}[ext] || '📁';
+}
+
+function onCmpOrigSelected(event) {
+  const f = event.target.files[0];
+  event.target.value = '';
+  if (!f) return;
+  cmpOriginal = f;
+  _renderCmpPanel();
+}
+
+function removeCmpOrig(e) {
+  if (e) e.stopPropagation();
+  cmpOriginal = null;
+  _renderCmpPanel();
+}
+
+function onCmpCopySelected(event) {
+  Array.from(event.target.files).forEach(f => {
+    if (cmpCopies.length < 10) cmpCopies.push(f);
+  });
+  event.target.value = '';
+  _renderCmpPanel();
+}
+
+function removeCmpCopy(idx) {
+  cmpCopies.splice(idx, 1);
+  _renderCmpPanel();
+}
+
+function _renderCmpPanel() {
+  const zone  = document.getElementById('cmp-orig-zone');
+  const inner = document.getElementById('cmp-orig-inner');
+
+  if (cmpOriginal) {
+    zone.classList.add('has-file');
+    inner.innerHTML = `
+      <span style="font-size:16px;flex-shrink:0">${_cmpDocIcon(cmpOriginal.name)}</span>
+      <span class="cmp-chip-name">${esc(cmpOriginal.name)}</span>
+      <button class="cmp-chip-rm" onclick="removeCmpOrig(event)" title="Удалить">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>`;
+  } else {
+    zone.classList.remove('has-file');
+    inner.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
+           stroke-linecap="round" stroke-linejoin="round" style="width:18px;height:18px;flex-shrink:0">
+        <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+        <line x1="12" y1="18" x2="12" y2="12"/>
+        <line x1="9" y1="15" x2="15" y2="15"/>
+      </svg>
+      <span>Загрузить оригинал</span>`;
+  }
+
+  const list = document.getElementById('cmp-copies-list');
+  list.innerHTML = cmpCopies.map((f, i) => `
+    <div class="cmp-copy-item">
+      <span style="font-size:14px;flex-shrink:0">${_cmpDocIcon(f.name)}</span>
+      <span class="cmp-chip-name">${esc(f.name)}</span>
+      <button class="cmp-chip-rm" onclick="removeCmpCopy(${i})" title="Удалить">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+          <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+    </div>`).join('');
+
+  document.getElementById('cmp-run-btn').disabled = !cmpOriginal || cmpCopies.length === 0;
+}
+
+async function startComparison() {
+  if (!cmpOriginal || cmpCopies.length === 0 || isStreaming) return;
+
+  const model = document.getElementById('model-select').value || 'gemma3:4b';
+  isStreaming = true;
+  abortController = new AbortController();
+
+  const btn = document.getElementById('cmp-run-btn');
+  btn.disabled = true;
+  btn.textContent = 'Анализирую...';
+
+  const inner = document.getElementById('chat-inner');
+  inner.innerHTML = '';
+
+  const header = document.createElement('div');
+  header.className = 'cmp-result-header';
+  const copyTags = cmpCopies
+    .map(f => `<span class="cmp-result-doc copy">${_cmpDocIcon(f.name)} ${esc(f.name)}</span>`)
+    .join('');
+  header.innerHTML = `
+    <div class="cmp-result-title">Сравнение документов</div>
+    <div class="cmp-result-docs">
+      <span class="cmp-result-doc orig">${_cmpDocIcon(cmpOriginal.name)} ${esc(cmpOriginal.name)}</span>
+      <span class="cmp-result-arrow">→</span>
+      ${copyTags}
+    </div>`;
+  inner.appendChild(header);
+
+  const msgDiv = document.createElement('div');
+  msgDiv.className = 'msg assistant';
+  msgDiv.innerHTML = `
+    <div class="msg-avatar"><img src="/ico.png" alt="" style="width:20px;height:20px;object-fit:contain;border-radius:6px;"></div>
+    <div class="msg-body">
+      <div class="msg-role">БелнипиAI</div>
+      <div class="msg-content" id="cmp-result-content"></div>
+    </div>`;
+  inner.appendChild(msgDiv);
+
+  const contentEl = document.getElementById('cmp-result-content');
+  const dots = document.createElement('div');
+  dots.className = 'thinking';
+  dots.innerHTML = '<span></span><span></span><span></span>';
+  contentEl.appendChild(dots);
+
+  userScrolled = false;
+  scrollEnd(true);
+
+  const fd = new FormData();
+  fd.append('model', model);
+  fd.append('original', cmpOriginal);
+  cmpCopies.forEach(f => fd.append('copies', f));
+
+  let raw = '', first = true;
+  try {
+    const res = await fetch('/api/compare', {
+      method: 'POST', body: fd, signal: abortController.signal
+    });
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      for (const line of dec.decode(value).split('\n')) {
+        if (!line.startsWith('data: ')) continue;
+        const payload = line.slice(6);
+        if (payload === '[DONE]') break;
+        try {
+          const o = JSON.parse(payload);
+          if (o.error) { showToast(o.error, true); break; }
+          if (o.text) {
+            if (first) { dots.remove(); first = false; }
+            raw += o.text;
+            contentEl.innerHTML = parseMd(raw) + '<span class="cursor"></span>';
+            addCodeBtns(contentEl);
+            scrollEnd();
+          }
+        } catch(e) {}
+      }
+    }
+  } catch(err) {
+    if (err.name !== 'AbortError') {
+      if (first) dots.remove();
+      contentEl.innerHTML = '<span style="color:var(--red)">Ошибка соединения с сервером</span>';
+      showToast('Ошибка соединения', true);
+    }
+  }
+
+  const cur = contentEl.querySelector('.cursor');
+  if (cur) cur.remove();
+  if (first) dots.remove();
+  if (raw) {
+    contentEl.innerHTML = parseMd(raw);
+    addCodeBtns(contentEl);
+    addMsgCopy(contentEl, contentEl.innerHTML);
+  }
+
+  isStreaming = false;
+  abortController = null;
+  btn.disabled = false;
+  btn.textContent = 'Сравнить документы';
+  scrollEnd();
 }
 
 // ── init ──────────────────────────────────────────────────────────────────────
